@@ -1,0 +1,547 @@
+import asyncio, base64, binascii, hmac, logging, os, time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from pathlib import Path
+import json
+from threading import Lock
+from .config import Settings
+from .storage import Store
+from .collector import MarketCollector
+from .paperbot import PaperBot
+from .reporting import write_report
+from .intelligence import analyze_ticks
+from .timing import evaluate_timing, evaluate_payout_timing
+from .strategies import candidate_strategies, ForecastContext
+
+logging.basicConfig(level=logging.INFO)
+settings=Settings.from_env(); store=Store(settings.database_path)
+paperbot=PaperBot(store,settings.paper_stake,settings.max_paper_stake,settings.daily_loss_cap,settings.max_trades_per_day)
+collector=MarketCollector(settings,store,paperbot)
+collector_task=None
+_report_cache={"created":0.0,"value":None}
+_timing_cache={}
+_report_lock=Lock()
+_timing_lock=Lock()
+
+def _auth_credentials():
+    username=os.getenv("BROMAX_AUTH_USERNAME")
+    password=os.getenv("BROMAX_AUTH_PASSWORD")
+    if bool(username) != bool(password):
+        raise RuntimeError("Set both BROMAX_AUTH_USERNAME and BROMAX_AUTH_PASSWORD")
+    return username,password
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global collector_task
+    auth_required=os.getenv("BROMAX_REQUIRE_AUTH","").lower() in {"1","true","yes"}
+    username,password=_auth_credentials()
+    if auth_required and not username:
+        raise RuntimeError("BROMAX_REQUIRE_AUTH is enabled but authentication credentials are not configured")
+    collector_task=asyncio.create_task(collector.run_forever())
+    yield
+    collector_task.cancel()
+    try: await collector_task
+    except asyncio.CancelledError: pass
+
+app=FastAPI(title="BROMAX MATCH Research",version="2.2.0",lifespan=lifespan)
+
+@app.middleware("http")
+async def require_basic_auth(request, call_next):
+    username,password=_auth_credentials()
+    auth_required=os.getenv("BROMAX_REQUIRE_AUTH","").lower() in {"1","true","yes"}
+    if not username:
+        if auth_required:
+            raise RuntimeError("BROMAX_REQUIRE_AUTH is enabled but authentication credentials are not configured")
+        return await call_next(request)
+    header=request.headers.get("authorization","")
+    scheme,separator,encoded=header.partition(" ")
+    if separator and scheme.lower()=="basic":
+        try:
+            decoded=base64.b64decode(encoded,validate=True).decode("utf-8")
+        except (binascii.Error,UnicodeDecodeError,ValueError):
+            decoded=""
+        supplied_username,colon,supplied_password=decoded.partition(":")
+        if (colon and hmac.compare_digest(supplied_username.encode("utf-8"),username.encode("utf-8"))
+                and hmac.compare_digest(supplied_password.encode("utf-8"),password.encode("utf-8"))):
+            return await call_next(request)
+    return PlainTextResponse(
+        "Authentication required",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="BROMAX", charset="UTF-8"'},
+    )
+
+@app.get("/health")
+def health():
+    with store.connect() as c:
+        counts={s:c.execute("SELECT COUNT(*) FROM ticks WHERE symbol=?",(s,)).fetchone()[0] for s in settings.symbols}
+        latest={}
+        for s in settings.symbols:
+            r=c.execute("SELECT epoch,quote_text,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT 1",(s,)).fetchone()
+            latest[s]=dict(r) if r else None
+    stale={s:(collector.last_received.get(s) is None or time.time()-collector.last_received[s]>settings.max_data_age_seconds) for s in settings.symbols}
+    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"recent_errors":collector.errors[-10:]}
+
+@app.get("/ticks/latest")
+def latest_ticks(symbol: str, limit: int=50):
+    if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    with store.connect() as c:
+        rows=c.execute("SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",(symbol,max(1,min(limit,1000)))).fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/digits/distribution")
+def distribution(symbol: str, window: int=1000):
+    if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    rows=store.history(symbol,max(10,min(window,10000))); counts={str(i):0 for i in range(10)}
+    for r in rows: counts[str(r["digit"])] += 1
+    n=len(rows)
+    return {"symbol":symbol,"n":n,"counts":counts,"frequencies":{k:(v/n if n else None) for k,v in counts.items()},"uniform_reference":0.1}
+
+@app.get("/forecasts")
+def forecasts(symbol: str, limit: int = 500):
+    if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    if limit < 1 or limit > 5000: raise HTTPException(422,"limit must be between 1 and 5000")
+    return store.forecasts(symbol,limit=limit)
+
+@app.get("/report")
+def report():
+    with _report_lock:
+        if _report_cache["value"] is None or time.monotonic()-_report_cache["created"]>=15:
+            _report_cache["value"]=write_report(store,settings.symbols)
+            _report_cache["created"]=time.monotonic()
+        return _report_cache["value"]
+
+@app.get("/bridge/status")
+def bridge_status():
+    """Health of the intelligence-to-paper-execution handoff; never places live orders."""
+    report_path=Path("reports/bromax_report.json")
+    approvals_path=Path("approved_strategies.json")
+    approvals={}
+    if approvals_path.exists():
+        try: approvals=json.loads(approvals_path.read_text()).get("approved",{})
+        except Exception: approvals={}
+    latest={}
+    for symbol in settings.symbols:
+        rows=store.forecasts(symbol,limit=1)
+        row=rows[-1] if rows else None
+        latest[symbol]={
+            "forecast": row,
+            "handoff": "paper_candidate_only" if row else "waiting_for_forecast",
+            "approved_strategy_ids": approvals.get(symbol,[]),
+        }
+    payout_choices={symbol:evaluate_payout_timing(store.duration_events(symbol)) for symbol in settings.symbols}
+    return {
+        "system": "BROMAX Intelligence + Deriv Paper Execution Bridge",
+        "mode": "SIMULATED_ONLY",
+        "market_data": "public_deriv_ticks",
+        "quote_source": "Deriv_read_only_proposals",
+        "execution": "paper_only_no_buy_endpoint",
+        "strategy_approval_file_present": approvals_path.exists(),
+        "research_report_present": report_path.exists(),
+        "symbols": latest,
+        "contract_protocol": {"type": "DIGITMATCH", "duration_candidates": [1,2,3,4,5], "duration_unit": "t", "selection": "quote_backed_out_of_sample_profitability"},
+        "payout_optimized_duration": {s:r.get("best_duration") for s,r in payout_choices.items()},
+        "note": "The intelligence engine freezes forecasts, captures read-only Deriv proposals for 1-5 ticks, and settles duration research contracts against exact future ticks. The READY panel exposes only the statistically selected duration after quote, volatility and risk checks. No real account authentication or live order placement exists."
+    }
+
+
+@app.get("/signals/ready")
+def ready_signal(symbol: str):
+    """Expose the statistically selected duration when its live quote is still valid.
+
+    The collector has already recorded every candidate duration in the paper
+    quote/settlement ledger. This endpoint never buys or sends a live order.
+    """
+    from decimal import Decimal, InvalidOperation
+    import time as _time
+    if symbol not in settings.symbols:
+        raise HTTPException(404, "Symbol not configured")
+    rows=store.forecasts(symbol)
+    approved_ids=[]
+    try:
+        approval_data=json.loads(Path("approved_strategies.json").read_text())
+        approved_ids=approval_data.get("approved",{}).get(symbol,[])
+    except Exception: pass
+    if not rows:
+        return {"symbol":symbol,"status":"WAITING","eligible":False,"reason":"No forecast has been recorded for this market yet.","signal":None,"approved_strategy_ids":approved_ids}
+    payout_evidence=evaluate_payout_timing(store.duration_events(symbol))
+    best=payout_evidence.get("best_candidate")
+    if not best:
+        return {"symbol":symbol,"status":"WAITING","eligible":False,
+                "reason":"No duration has passed quote-backed, chronological, payout-adjusted out-of-sample profitability testing. Candidate forecasts remain research-only.",
+                "signal":None,"approved_strategy_ids":approved_ids,
+                "payout_timing":{"status":payout_evidence.get("status"),"best_duration":None}}
+    strategy_id=best.get("strategy_id"); duration=int(best.get("duration_ticks") or 0)
+    if strategy_id not in approved_ids or not paperbot.approved(symbol,strategy_id):
+        return {"symbol":symbol,"status":"WAITING","eligible":False,
+                "reason":"The payout-optimized strategy does not have the separate strategy approval required for paper signals.",
+                "signal":None,"approved_strategy_ids":approved_ids,
+                "payout_timing":{"best_duration":duration,"strategy_id":strategy_id}}
+    latest=next((row for row in reversed(rows) if row.get("strategy_id")==strategy_id),None)
+    if latest is None or latest.get("hit") is not None:
+        return {"symbol":symbol,"status":"WAITING","eligible":False,
+                "reason":"Waiting for a fresh forecast from the payout-optimized strategy.","signal":None,
+                "approved_strategy_ids":approved_ids,"payout_timing":{"best_duration":duration}}
+    q=store.duration_quote(latest["seq"],duration)
+    if not q:
+        return {"symbol":symbol,"status":"WAITING","eligible":False,
+                "reason":"The selected duration does not have a contemporaneous Deriv proposal quote for this forecast tick.",
+                "signal":None,"approved_strategy_ids":approved_ids,"payout_timing":{"best_duration":duration}}
+    if int(q.get("quote_spot_time") or 0)!=int(latest.get("forecast_epoch") or 0) or _time.time()>=int(latest["forecast_epoch"])+1:
+        return {"symbol":symbol,"status":"EXPIRED","eligible":False,
+                "reason":"The duration-specific proposal quote is stale or its one-tick entry window has expired.",
+                "signal":None,"approved_strategy_ids":approved_ids}
+    try:
+        probability=Decimal(str((latest.get("probabilities") or [])[int(latest["prediction"])]))
+        payout=Decimal(str(q["payout"])); stake=Decimal(str(q["stake"]))
+        expected_value=probability*payout-stake; break_even=stake/payout
+    except (InvalidOperation,ValueError,TypeError,IndexError,ZeroDivisionError):
+        return {"symbol":symbol,"status":"REJECTED","eligible":False,"reason":"Forecast probabilities or duration proposal values failed validation.","signal":None,"approved_strategy_ids":approved_ids}
+    if expected_value<=0:
+        return {"symbol":symbol,"status":"REJECTED","eligible":False,
+                "reason":"The current duration-specific proposal does not have positive model-estimated expected value.","signal":None,
+                "approved_strategy_ids":approved_ids}
+    timing_evidence=evaluate_timing(store.history(symbol,limit=10000),rows)
+    current_regime=timing_evidence.get("current_volatility_regime")
+    timing_row=next((x for x in timing_evidence.get("strategies",[]) if x.get("strategy_id")==strategy_id and x.get("duration_ticks")==duration),None)
+    regime_row=next((x for x in (timing_row or {}).get("volatility_regimes",[]) if x.get("regime")==current_regime),None)
+    if not regime_row or regime_row.get("status")!="CONFIRMED_FOR_THIS_STRATEGY_AND_HORIZON":
+        return {"symbol":symbol,"status":"REJECTED","eligible":False,
+                "reason":"Volatility confirmation is not established for the selected strategy, duration and current regime on untouched final-test data.",
+                "signal":None,"approved_strategy_ids":approved_ids,
+                "volatility":{"regime":current_regime,"status":"UNCONFIRMED"}}
+    if not paperbot.limits_ok(symbol,stake):
+        return {"symbol":symbol,"status":"REJECTED","eligible":False,
+                "reason":"Paper stake, daily loss or trade-count limits block this opportunity.","signal":None,"approved_strategy_ids":approved_ids}
+    signal={"signal_id":f"BROMAX-{latest['seq']}-T{duration}","symbol":symbol,
+            "strategy_id":strategy_id,"predicted_digit":int(latest["prediction"]),
+            "contract":"DIGITMATCH","duration":duration,"duration_unit":"t",
+            "stake":str(stake),"payout":str(payout),"probability":str(probability),
+            "break_even_probability":str(break_even),"expected_value":str(expected_value),
+            "volatility_regime":current_regime,"volatility_confirmation":"CONFIRMED",
+            "duration_profitability_status":"OUT_OF_SAMPLE_PROFIT_EVIDENCE",
+            "final_test_mean_return":best["final_test"].get("mean_return_on_stake"),
+            "final_test_return_ci95":best["final_test"].get("mean_return_ci95"),
+            "expires_epoch":int(latest["forecast_epoch"])+1,"forecast_epoch":int(latest["forecast_epoch"]),
+            "proposal_id":q.get("proposal_id"),"execution_mode":"PAPER_SIMULATION_ONLY"}
+    return {"symbol":symbol,"status":"READY","eligible":True,
+            "reason":"The best quote-backed duration passed final-test profitability, current quote EV, strategy approval, volatility confirmation and paper-risk checks. It is tracked in the duration paper ledger; no live order is placed.",
+            "signal":signal,"approved_strategy_ids":approved_ids}
+
+
+@app.get("/paper/status")
+def paper_status():
+    events=store.paper_events()
+    opened=[e for e in events if e["event_type"]=="PAPER_OPEN"]
+    settled=[e for e in events if e["event_type"]=="PAPER_SETTLE"]
+    settled_ids={e["note"] for e in settled}
+    pending=sum(1 for e in opened if str(e["seq"]) not in settled_ids)
+    return {"enabled":True,"mode":"SIMULATED_ONLY","stake":str(settings.paper_stake),"max_stake":str(settings.max_paper_stake),"daily_loss_cap":str(settings.daily_loss_cap),"max_trades_per_day":settings.max_trades_per_day,"opened_total":len(opened),"settled_total":len(settled),"pending":pending,"approved_strategies_file":"approved_strategies.json","live_execution":False}
+
+
+@app.get("/paper/trades")
+def paper_trades(symbol: str | None = None):
+    if symbol is not None and symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    return store.paper_events(symbol)
+
+
+@app.get("/intelligence")
+def intelligence(symbol: str, window: int = 1000):
+    if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    if window < 100 or window > 10000: raise HTTPException(422,"window must be between 100 and 10000")
+    frame=store.ticks_frame(symbol)
+    rows=frame.tail(window).to_dict(orient="records") if not frame.empty else []
+    return analyze_ticks(rows,symbol,window)
+
+@app.get("/timing")
+def timing_research(symbol: str):
+    """Compare 1-5 tick horizons and volatility regimes; research only."""
+    if symbol not in settings.symbols:
+        raise HTTPException(404, "Symbol not configured")
+    with _timing_lock:
+        cached=_timing_cache.get(symbol)
+        if cached and time.monotonic()-cached["created"]<5:
+            return cached["value"]
+        ticks = store.history(symbol, limit=10000)
+        forecasts = store.forecasts(symbol, limit=50000)
+        result = evaluate_timing(ticks, forecasts)
+        result["payout_optimization"] = evaluate_payout_timing(store.duration_events(symbol))
+        result["symbol"] = symbol
+        _timing_cache[symbol]={"created":time.monotonic(),"value":result}
+        return result
+
+def _digit_duration_results(events, strategy_id):
+    quotes={}
+    settled={}
+    for row in events:
+        key=(int(row.get("forecast_seq") or 0),int(row.get("duration_ticks") or 0))
+        if row.get("event_type")=="QUOTE":
+            quotes[key]=row
+        elif row.get("event_type")=="SETTLE":
+            settled[key]=row
+    result={(digit,duration):{"n":0,"wins":0,"net_pnl":0.0,"stake":0.0} for digit in range(10) for duration in (1,2,3,4,5)}
+    for key,quote in quotes.items():
+        outcome=settled.get(key)
+        if not outcome or quote.get("strategy_id")!=strategy_id:
+            continue
+        try:
+            epoch=int(quote["forecast_epoch"])
+            duration=int(quote["duration_ticks"])
+            prediction=int(quote["prediction"])
+            if int(quote["quote_spot_time"])!=epoch or int(outcome["actual_epoch"])!=epoch+duration:
+                continue
+            stake=Decimal(str(quote["stake"])); payout=Decimal(str(quote["payout"]))
+            hit=int(outcome["hit"])
+        except (KeyError,TypeError,ValueError,ArithmeticError):
+            continue
+        if prediction not in range(10) or duration not in range(1,6) or stake<=0:
+            continue
+        row=result[(prediction,duration)]
+        row["n"]+=1
+        row["wins"]+=hit
+        row["net_pnl"]+=float(payout-stake if hit else -stake)
+        row["stake"]+=float(stake)
+    for row in result.values():
+        row["hit_rate"]=row["wins"]/row["n"] if row["n"] else None
+        row["mean_return_on_stake"]=row["net_pnl"]/row["stake"] if row["stake"] else None
+        row["net_pnl"]=round(row["net_pnl"],8)
+    return result
+
+@app.get("/digits/analysis")
+def digit_analysis(symbol: str):
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    report_data=report()
+    report_item=next((x for x in report_data.get("symbols",[]) if x.get("symbol")==symbol),{})
+    evidence=report_item.get("digit_evidence") or {"selected_strategy_id":None,"digits":[]}
+    strategy_id=evidence.get("selected_strategy_id")
+    signal_data=signals(symbol)
+    current_model=next((x for x in signal_data.get("signals",[]) if x.get("strategy_id")==strategy_id),None)
+    rows_by_digit={int(x["digit"]):x for x in evidence.get("digits",[])}
+    history=store.history(symbol,limit=1000)
+    recent=history[-100:] if history else []
+    counts={digit:sum(int(row["digit"])==digit for row in history) for digit in range(10)}
+    recent_counts={digit:sum(int(row["digit"])==digit for row in recent) for digit in range(10)}
+    latest_quotes=store.forecasts(symbol,limit=10)
+    latest_epoch=max((int(x["forecast_epoch"]) for x in latest_quotes),default=None)
+    latest_quotes=[x for x in latest_quotes if latest_epoch is not None and int(x["forecast_epoch"])==latest_epoch]
+    duration_events=store.duration_events(symbol)
+    duration_stats=_digit_duration_results(duration_events,strategy_id)
+    approved=bool(strategy_id and paperbot.approved(symbol,strategy_id))
+    timing=timing_research(symbol)
+    payout=timing.get("payout_optimization") or {}
+    best_duration=payout.get("best_candidate")
+    timing_rows={(x.get("strategy_id"),int(x.get("duration_ticks") or 0)):x for x in payout.get("strategies",[])}
+    volatility_rows={(x.get("strategy_id"),int(x.get("duration_ticks") or 0)):x for x in timing.get("strategies",[])}
+    current_regime=timing.get("current_volatility_regime")
+    current_volatility_row=volatility_rows.get((strategy_id,1),{})
+    current_regime_evidence=next((x for x in current_volatility_row.get("volatility_regimes",[])
+                                  if x.get("regime")==current_regime),None)
+    if current_regime_evidence:
+        val=current_regime_evidence.get("validation") or {}
+        final=current_regime_evidence.get("final_test") or {}
+        volatility_checks=[
+            val.get("n",0)>=1000,
+            bool(val.get("hit_rate_ci95") and val["hit_rate_ci95"][0]>.10),
+            val.get("holm_adjusted_p",1)<.05,
+            final.get("n",0)>=1000,
+            bool(final.get("hit_rate_ci95") and final["hit_rate_ci95"][0]>.10),
+            final.get("holm_adjusted_p",1)<.05,
+        ]
+        volatility_filter={
+            "regime":current_regime,
+            "status":"PASS" if current_regime_evidence.get("status")=="CONFIRMED_FOR_THIS_STRATEGY_AND_HORIZON" else "FAIL",
+            "health_percent":round(100*sum(volatility_checks)/len(volatility_checks)),
+            "checks_passed":sum(volatility_checks),
+            "checks_total":len(volatility_checks),
+        }
+    else:
+        volatility_filter={"regime":current_regime,"status":"INSUFFICIENT DATA","health_percent":None,
+                           "checks_passed":0,"checks_total":6}
+    digit_output=[]
+    now=time.time()
+    for digit in range(10):
+        evidence_row=rows_by_digit.get(digit,{})
+        validation=evidence_row.get("validation") or {}
+        current_probability=None
+        if current_model and digit<len(current_model.get("probabilities",[])):
+            current_probability=float(current_model["probabilities"][digit])
+        quote_by_duration={}
+        for duration in (1,2,3,4,5):
+            quote=None
+            quote_forecast=None
+            for forecast in latest_quotes:
+                if int(forecast["prediction"])!=digit:
+                    continue
+                candidate=store.duration_quote(forecast["seq"],duration)
+                if candidate:
+                    quote=candidate
+                    quote_forecast=forecast
+                    break
+            valid=bool(quote and quote_forecast
+                       and int(quote.get("quote_spot_time") or 0)==int(quote_forecast["forecast_epoch"])
+                       and now<int(quote_forecast["forecast_epoch"])+1)
+            probability=current_probability
+            ev=break_even=None
+            if valid and probability is not None:
+                try:
+                    stake=Decimal(str(quote["stake"])); payout_value=Decimal(str(quote["payout"]))
+                    ev=str(Decimal(str(probability))*payout_value-stake)
+                    break_even=str(stake/payout_value) if payout_value else None
+                except (InvalidOperation,KeyError,TypeError,ValueError,ZeroDivisionError):
+                    valid=False
+            duration_history=duration_stats[(digit,duration)]
+            historical=timing_rows.get((strategy_id,duration),{})
+            vol_candidate=volatility_rows.get((strategy_id,duration),{})
+            current_regime=timing.get("current_volatility_regime")
+            volatility_confirmed=any(x.get("regime")==current_regime and x.get("status")=="CONFIRMED_FOR_THIS_STRATEGY_AND_HORIZON"
+                                     for x in vol_candidate.get("volatility_regimes",[]))
+            duration_gate=bool(best_duration
+                                and best_duration.get("strategy_id")==strategy_id
+                                and int(best_duration.get("duration_ticks") or 0)==duration
+                                and historical.get("payout_ev_status")=="OUT_OF_SAMPLE_PROFIT_EVIDENCE")
+            reasons=list(evidence_row.get("gate_reasons") or [])
+            if not approved:
+                reasons.append("This strategy has not passed the separate strategy approval file check.")
+            if not current_model or int(current_model.get("predicted_digit",-1))!=digit:
+                reasons.append("The development-selected live forecast does not predict this digit.")
+            if not valid:
+                reasons.append("No contemporaneous unexpired Deriv proposal quote is available for this digit and duration.")
+            if ev is None or Decimal(ev)<=0:
+                reasons.append("The current model probability does not show positive expected value at this quote.")
+            if duration!=1:
+                reasons.append("Per-digit untouched-test evidence has not been frozen for this duration.")
+            if not duration_gate:
+                reasons.append("This strategy-duration pair has no qualifying quote-backed final-test result.")
+            if not volatility_confirmed:
+                reasons.append("Volatility compatibility is not confirmed for this strategy and duration.")
+            limits_ok=bool(valid and quote and paperbot.limits_ok(symbol,Decimal(str(quote["stake"]))))
+            if not limits_ok:
+                reasons.append("Current paper risk limits do not allow this stake.")
+            qualified=bool(evidence_row.get("evidence_qualified") and approved and current_model
+                           and int(current_model.get("predicted_digit",-1))==digit
+                           and valid and ev is not None and Decimal(ev)>0 and duration==1
+                           and duration_gate and volatility_confirmed and limits_ok)
+            quote_by_duration[str(duration)]={
+                "historical":{"n":duration_history["n"],"hit_rate":duration_history["hit_rate"],
+                              "net_pnl":duration_history["net_pnl"],"mean_return_on_stake":duration_history["mean_return_on_stake"],
+                              "out_of_sample_status":historical.get("payout_ev_status","RESEARCH_ONLY")},
+                "current_quote":{"available":bool(quote),"valid":valid,
+                                 "stake":quote.get("stake") if quote else None,
+                                 "payout":quote.get("payout") if quote else None,
+                                 "break_even_probability":break_even,"expected_value":ev,
+                                 "spot_time":quote.get("quote_spot_time") if quote else None},
+                "decision":"PAPER TRADE CANDIDATE" if qualified else "DO NOT TRADE",
+                "reasons":[] if qualified else list(dict.fromkeys(reasons)),
+            }
+        digit_output.append({
+            "digit":digit,"estimated_win_probability":current_probability,
+            "historical_observed_match_rate":validation.get("hit_rate"),
+            "confidence_interval_95":validation.get("hit_rate_ci95"),
+            "health_percent":evidence_row.get("health_score") if evidence_row else None,
+            "health_components":evidence_row.get("health_components",{}),
+            "sample_size":validation.get("n",0),
+            "quoted_sample_size":validation.get("payout_adjusted",{}).get("n_with_actual_quote",0),
+            "current_frequency":counts[digit]/len(history) if history else None,
+            "recent_frequency":recent_counts[digit]/len(recent) if recent else None,
+            "validation":validation,"final_test":evidence_row.get("final_test"),
+            "recent_performance":evidence_row.get("recent"),
+            "walk_forward_folds":evidence_row.get("walk_forward_folds",[]),
+            "volatility_regimes":evidence_row.get("volatility_regimes",[]),
+            "durations":quote_by_duration,
+            "decision":"PAPER TRADE CANDIDATE" if any(x["decision"]=="PAPER TRADE CANDIDATE" for x in quote_by_duration.values()) else "DO NOT TRADE",
+            "reasons":list(dict.fromkeys(
+                list(evidence_row.get("gate_reasons") or [])
+                +[reason for duration_data in quote_by_duration.values() for reason in duration_data["reasons"]]
+            )),
+        })
+    settled=[x for x in store.paper_events(symbol) if x.get("event_type")=="PAPER_SETTLE"]
+    def performance_groups(key):
+        groups={}
+        for row in settled:
+            name=str(row.get(key) if row.get(key) is not None else "unknown")
+            value=groups.setdefault(name,{"contracts":0,"wins":0,"net_pnl":0.0})
+            value["contracts"]+=1
+            value["wins"]+=int(row.get("hit") or 0)
+            value["net_pnl"]+=float(row.get("paper_pnl") or 0)
+        for value in groups.values():
+            value["win_rate"]=value["wins"]/value["contracts"] if value["contracts"] else None
+            value["net_pnl"]=round(value["net_pnl"],8)
+        return groups
+    tick_stale=bool(collector.last_received.get(symbol) is None or now-collector.last_received[symbol]>settings.max_data_age_seconds)
+    market_health=0 if tick_stale or len(history)<2 else round(100*sum(int(b["epoch"])-int(a["epoch"])==1 for a,b in zip(history[:-1],history[1:]))/(len(history)-1))
+    strategies_by_id={x.get("strategy_id"):x for x in report_item.get("strategies",[])}
+    strategy_output=[]
+    for candidate in signal_data.get("signals",[]):
+        result=strategies_by_id.get(candidate["strategy_id"],{})
+        validation=result.get("validation") or {}
+        strategy_output.append({
+            "strategy_id":candidate["strategy_id"],"version":candidate["version"],
+            "predicted_digit":candidate["predicted_digit"],
+            "predicted_digit_probability":candidate["predicted_digit_probability"],
+            "probabilities":candidate["probabilities"],
+            "validation_sample_size":validation.get("n"),
+            "validation_hit_rate":validation.get("hit_rate"),
+            "validation_brier":validation.get("brier_multiclass_10class"),
+            "validation_calibration":validation.get("reliability",[]),
+            "validation_status":result.get("validation_verdict","INSUFFICIENT_DATA"),
+            "final_test_status":result.get("final_test_verdict") or result.get("final_test_status"),
+            "selected":candidate["strategy_id"]==strategy_id,
+            "explicitly_approved":paperbot.approved(symbol,candidate["strategy_id"]),
+        })
+    return {
+        "symbol":symbol,"mode":"PAPER_ONLY","trade_authorized":False,
+        "evaluated_at":time.time(),"selected_strategy_id":strategy_id,
+        "selection_basis":evidence.get("selection_basis"),
+        "health_definition":evidence.get("health_definition"),
+        "market_health_percent":market_health,"market_feed_stale":tick_stale,
+        "latest_tick":dict(history[-1]) if history else None,
+        "volatility":{"regime":timing.get("current_volatility_regime"),
+                      "reading":timing.get("current_volatility"),
+                      "short_term":timing.get("short_term_volatility"),
+                      "long_term":timing.get("long_term_volatility")},
+        "volatility_filter":volatility_filter,
+        "best_duration_candidate":best_duration,
+        "strategies":strategy_output,"digits":digit_output,
+        "paper_performance":{"by_digit":performance_groups("prediction"),
+                             "by_strategy":performance_groups("strategy_id"),
+                             "settled_contracts":len(settled)},
+        "note":"A digit's health is a research evidence score, not a win probability. Every displayed estimate comes from the current model or recorded outcomes. TRADE status is paper-only and requires all evidence, quote, timing, approval and risk gates.",
+    }
+
+@app.get("/signals")
+def signals(symbol: str):
+    """Current candidate forecasts for inspection only; never a trade authorization."""
+    if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
+    history=store.history(symbol,limit=1000)
+    if len(history) < settings.min_history_ticks:
+        return {"symbol":symbol,"status":"insufficient_history","required_ticks":settings.min_history_ticks,"observed_ticks":len(history),"signals":[],"trade_authorized":False}
+    digits=tuple(int(r["digit"]) for r in history)
+    counts=store.digit_counts(symbol)
+    latest=history[-1]
+    context=ForecastContext(symbol,int(latest["id"]),int(latest["epoch"]),digits,tuple(int(x) for x in counts))
+    forecasts=[strategy.forecast(context) for strategy in candidate_strategies()]
+    output=[]
+    for f in forecasts:
+        output.append({"strategy_id":f.strategy_id,"version":f.version,"parameters":f.parameters,
+                       "predicted_digit":f.prediction,"predicted_digit_probability":f.probabilities[f.prediction],
+                       "probabilities":list(f.probabilities),"history_support":len(digits),
+                       "status":"RESEARCH_ONLY_NOT_APPROVED"})
+    output.sort(key=lambda x:x["predicted_digit_probability"],reverse=True)
+    return {"symbol":symbol,"observed_tick_id":int(latest["id"]),"observed_epoch":int(latest["epoch"]),
+            "signals":output,"trade_authorized":False,
+            "note":"Ranking is descriptive only. It is not a calibrated confidence score and does not bypass validation, quote, or paper-risk gates."}
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    options="".join(f'<option value="{s}">{s}</option>' for s in settings.symbols)
+    page=(Path(__file__).parent / "dashboard_minimal.html").read_text(encoding="utf-8")
+    return page.replace("__SYMBOL_OPTIONS__",options)
+
+@app.get("/advanced", response_class=HTMLResponse)
+def advanced_dashboard():
+    options="".join(f'<option value="{s}">{s}</option>' for s in settings.symbols)
+    page=(Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+    return (page.replace("__SYMBOL_OPTIONS__",options)
+            .replace("__SYMBOLS_JSON__",json.dumps(list(settings.symbols)))
+            .replace("</header>",'<a href="/dashboard" style="color:#9ab9c8;margin-left:12px">Decision terminal</a></header>'))

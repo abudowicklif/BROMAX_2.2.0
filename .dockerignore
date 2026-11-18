@@ -1,0 +1,10 @@
+.venv
+__pycache__
+.pytest_cache
+*.py[cod]
+*.egg-info
+.env
+.git
+data
+reports
+approved_strategies.json

@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BROMAX — Decision Terminal</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
+</style>
+</head>
+<body>
+<header class="topbar"><div class="brand">BROMAX <small> / DECISION TERMINAL · PAPER ONLY</small></div><div class="tools"><select id="symbol" aria-label="Market symbol">__SYMBOL_OPTIONS__</select><a href="/advanced">Advanced analysis</a></div></header>
+<main class="shell">
+  <section class="section" aria-labelledby="market-heading">
+    <div class="section-title"><h2 id="market-heading">Market status</h2><span class="updated" id="updatedAt">Waiting for data</span></div>
+    <div class="market">
+      <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
+      <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
+      <div class="market-item"><span class="label">Latest tick · last digit</span><strong class="value" id="latestTick">—</strong></div>
+      <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
+    </div>
+  </section>
+
+  <section class="section signal" aria-labelledby="signal-heading">
+    <div class="section-title"><h2 id="signal-heading">Best trading signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
+    <div class="signal-grid">
+      <div class="signal-primary"><span class="label">Recommended digit</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
+      <div class="signal-item"><span class="label">Win probability</span><strong class="value" id="signalProbability">—</strong></div>
+      <div class="signal-item"><span class="label">Health</span><strong class="value" id="signalHealth">—</strong></div>
+      <div class="signal-item"><span class="label">Duration</span><strong class="value" id="signalDuration">—</strong></div>
+      <div class="signal-item"><span class="label">Quoted payout</span><strong class="value" id="signalPayout">—</strong></div>
+      <div class="signal-item"><span class="label">Expected value</span><strong class="value" id="signalEv">—</strong></div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="digits-heading">
+    <div class="section-title"><h2 id="digits-heading">Digit prediction · all ten digits</h2><span class="muted" id="decisionNote">Estimates are shown only when calculated.</span></div>
+    <div class="digit-wrap"><table>
+      <thead><tr><th>Digit</th><th>Win probability</th><th>Evidence health</th><th>Decision</th><th>Rejection reason</th></tr></thead>
+      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for research data.</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <div class="bottom">
+    <section class="section" aria-labelledby="volatility-heading">
+      <div class="section-title"><h2 id="volatility-heading">Volatility check</h2></div>
+      <div class="summary-grid">
+        <div><span class="label">Current condition</span><strong class="value" id="volatilityCondition">—</strong></div>
+        <div><span class="label">Volatility health</span><strong class="value" id="volatilityHealth">—</strong></div>
+        <div><span class="label">Signal filter</span><strong class="value" id="volatilityApproval">—</strong></div>
+      </div>
+    </section>
+    <section class="section" aria-labelledby="paper-heading">
+      <div class="section-title"><h2 id="paper-heading">Paper trading results</h2></div>
+      <div class="summary-grid">
+        <div><span class="label">Total trades</span><strong class="value" id="tradeTotal">0</strong></div>
+        <div><span class="label">Wins</span><strong class="value" id="tradeWins">0</strong></div>
+        <div><span class="label">Losses</span><strong class="value" id="tradeLosses">0</strong></div>
+        <div><span class="label">Win rate</span><strong class="value" id="tradeWinRate">—</strong></div>
+        <div><span class="label">Net paper profit</span><strong class="value" id="tradeProfit">—</strong></div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const state={symbol:$('symbol').value};
+const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
+const score=value=>value==null||!Number.isFinite(Number(value))?'—':`${Number(value)}%`;
+const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(Number(value));
+const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
+function renderMarket(health,ticks,symbol){
+  $('marketSymbol').textContent=symbol;
+  const stale=Boolean(health.stale?.[symbol]);
+  const connection=$('connection');connection.className=`status ${stale?'bad':'good'}`;
+  connection.querySelector('span').textContent=stale?'DISCONNECTED / STALE':'CONNECTED';
+  if(ticks.length){
+    const tick=ticks[0],age=Math.max(0,Math.floor(Date.now()/1000-Number(tick.epoch)));
+    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
+    $('freshness').textContent=`${stale?'STALE':'FRESH'} · ${age}s`;
+    $('freshness').className=`value ${stale?'bad-text':'good-text'}`;
+  }else{
+    $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
+  }
+}
+function renderSignal(ready,analysis){
+  const signal=ready?.eligible===true?ready.signal:null;
+  const digit=signal?analysis.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit)):null;
+  const durationData=digit?.durations?.[String(signal?.duration??1)];
+  const qualified=Boolean(signal&&digit?.decision==='PAPER TRADE CANDIDATE'&&durationData?.decision==='PAPER TRADE CANDIDATE');
+  const status=$('signalStatus'),hero=$('signalDigit');
+  if(!qualified){
+    status.className='trade-pill no-trade';status.textContent='NO TRADE';
+    hero.className='signal-digit empty';hero.textContent='NO QUALIFIED SIGNAL';
+    for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
+    return null;
+  }
+  status.className='trade-pill trade';status.textContent='TRADE · PAPER ONLY';
+  hero.className='signal-digit';hero.textContent=String(signal.predicted_digit);
+  $('signalProbability').textContent=pct(signal.probability);
+  $('signalHealth').textContent=score(digit.health_percent);
+  $('signalDuration').textContent=`${signal.duration} tick${Number(signal.duration)===1?'':'s'}`;
+  $('signalPayout').textContent=money(signal.payout);
+  $('signalEv').textContent=money(signal.expected_value);
+  return Number(signal.predicted_digit);
+}
+function renderDigits(analysis,signalDigit,ready){
+  const rows=analysis?.digits||[];
+  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>{
+    const row=rows.find(item=>Number(item.digit)===digit);
+    if(!row)return `<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">Research data unavailable.</td></tr>`;
+    const approved=signalDigit===digit;
+    const duration=row.durations?.[String(ready?.signal?.duration??1)];
+    let reason='';
+    if(!approved){
+      reason=row.decision==='PAPER TRADE CANDIDATE'?(ready?.reason||'The signal failed a final readiness check.'):(row.reasons?.[0]||duration?.reasons?.[0]||'No qualifying per-digit evidence.');
+    }
+    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason)}</td></tr>`;
+  }).join('');
+}
+function renderVolatility(analysis){
+  const data=analysis?.volatility_filter||{};
+  $('volatilityCondition').textContent=data.regime||'INSUFFICIENT DATA';
+  $('volatilityHealth').textContent=score(data.health_percent);
+  const passed=data.status==='PASS';
+  const approval=$('volatilityApproval');
+  approval.textContent=data.status||'INSUFFICIENT DATA';
+  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT DATA'?'warn-text':'bad-text'}`;
+}
+function renderPaper(events){
+  const opened=(events||[]).filter(event=>event.event_type==='PAPER_OPEN').length;
+  const settled=(events||[]).filter(event=>event.event_type==='PAPER_SETTLE');
+  const wins=settled.filter(event=>Number(event.hit)===1).length;
+  const losses=settled.length-wins;
+  const profit=settled.reduce((sum,event)=>sum+Number(event.paper_pnl||0),0);
+  $('tradeTotal').textContent=Number(opened).toLocaleString('en-US');
+  $('tradeWins').textContent=String(wins);$('tradeLosses').textContent=String(losses);
+  $('tradeWinRate').textContent=settled.length?`${(wins/settled.length*100).toFixed(1)}%`:'—';
+  $('tradeProfit').textContent=settled.length?money(profit):'—';
+  $('tradeProfit').className=`value ${settled.length?(profit>=0?'good-text':'bad-text'):''}`;
+}
+function renderUnavailable(error){
+  const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
+  $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
+  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
+  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
+  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval'])$(id).textContent='—';
+  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>`<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">API unavailable: ${safe(error.message)}</td></tr>`).join('');
+}
+async function refresh(){
+  try{
+    const symbol=state.symbol;
+    const [health,ticks,analysis,ready,events]=await Promise.all([
+      api('/health'),api(`/ticks/latest?symbol=${encodeURIComponent(symbol)}&limit=1`),
+      api(`/digits/analysis?symbol=${encodeURIComponent(symbol)}`),
+      api(`/signals/ready?symbol=${encodeURIComponent(symbol)}`),
+      api(`/paper/trades?symbol=${encodeURIComponent(symbol)}`)
+    ]);
+    renderMarket(health,ticks,symbol);
+    const selectedDigit=renderSignal(ready,analysis);
+    renderDigits(analysis,selectedDigit,ready);
+    renderVolatility(analysis);
+    renderPaper(events);
+    $('updatedAt').textContent=`Updated ${new Date().toLocaleTimeString()}`;
+  }catch(error){
+    renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
+  }
+}
+$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh()});
+refresh();setInterval(refresh,3000);
+</script>
+</body>
+</html>

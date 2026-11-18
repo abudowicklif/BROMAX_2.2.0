@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bromax"
+version = "2.2.0"
+description = "Auditable, paper-only Deriv MATCH research system"
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1", "websockets>=15,<17", "numpy>=2,<3", "pandas>=2.2,<4", "scipy>=1.14,<2", "pydantic>=2.9,<3", "python-dotenv>=1,<2"]
+
+[project.scripts]
+bromax-panel = "bromax.desktop:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "httpx>=0.27,<1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["bromax*"]
+exclude = ["tests*", "data*", "reports*"]
+
+[tool.setuptools.package-data]
+bromax = ["dashboard.html", "dashboard_minimal.html"]
