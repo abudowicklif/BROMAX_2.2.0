@@ -3,11 +3,28 @@ import time
 from decimal import Decimal
 import json
 from pathlib import Path
+from threading import Event
+
+_LIVE_KILL_SWITCH = Event()
+_LIVE_KILL_SWITCH.set()
 
 class ExecutionInterface:
-    """Deliberately disabled interface. No buy/sell methods exist in BROMAX."""
+    """Fail-closed execution boundary with a one-way emergency kill switch."""
     enabled = False
+
+    def __init__(self):
+        self._kill_switch = _LIVE_KILL_SWITCH
+
+    @property
+    def kill_switch_engaged(self):
+        return self._kill_switch.is_set()
+
+    def engage_kill_switch(self):
+        self._kill_switch.set()
+
     async def execute(self, *args, **kwargs):
+        if self.kill_switch_engaged:
+            raise RuntimeError("Emergency kill switch is engaged; execution is blocked")
         raise RuntimeError("Live execution is intentionally not implemented or enabled")
 
 class PaperBot:

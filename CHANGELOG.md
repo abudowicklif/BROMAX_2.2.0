@@ -1,3 +1,34 @@
+## Background proposal accounting
+- Bounded concurrent optional Deriv proposal connections with the collector's existing semaphore.
+- Moved quote, paper-gate, and duration-ledger writes to a serialized worker thread so they cannot synchronously stall live tick processing.
+- Added a collector test that proves the event loop remains responsive while quote-ledger persistence is blocked.
+
+## Dashboard clarity and refresh efficiency
+- Separated the latest-tick strategy batch from per-tick forecast history and collapsed each historical batch to its highest-probability research candidate.
+- Refreshed live pipeline/current forecasts every three seconds and the history table every 30 seconds.
+- Removed unused volatility and paper-trading placeholders; distinguished an in-progress analysis from stale market data.
+
+## Live tick pipeline performance
+- Added an epoch-aware forecast index for immediate next-tick scoring and chronologically ordered signal-history reads.
+- Cached the collector's existing 1,000-tick context in memory and refresh it after Deriv history backfills; strategy inputs remain unchanged.
+- Persisted each tick's existing strategy forecasts in one SQLite transaction instead of one transaction per strategy.
+- Added bounded monotonic stage timings and a lightweight `/performance` endpoint; no strategy, probability, or qualification rules changed.
+- Delivered the already-persisted latest-tick forecast batch through `/signals` instead of recalculating it per request; incomplete batches fail closed as `analysis_pending`.
+
+## Live market pipeline visibility
+- Added per-symbol connection, subscription, tick-quality, analysis, strategy, signal-generation, freshness, and error state to collector monitoring.
+- Reconnects after both network failures and normal WebSocket closure, then restores history context and tick subscriptions.
+- Backfilled older missing history without retrospective forecasts; all tick-history readers sort by market epoch.
+- Ignored duplicate epochs, dropped delayed out-of-order live ticks, and counted epoch gaps without disrupting the stream.
+- Added `/signals/history` for persisted strategy forecasts and surfaced pipeline status and signal history in the primary dashboard.
+- Kept existing strategy calculations, quote handling, signal qualification, and paper-only execution boundaries unchanged.
+- Added focused collector, reconnect, API, and dashboard tests.
+
+## Live-execution safety foundation
+- Added a process-wide, default-engaged, one-way execution kill switch and `POST /safety/kill-switch`.
+- Kept live execution unimplemented and disabled; the endpoint cannot clear the switch or place orders.
+- Added tests confirming the guard blocks execution and the API reports live execution remains unavailable.
+
 ## Deterministic multi-agent decision snapshot
 - Added eight typed specialist/coordinator roles that reuse existing research, calibration, volatility, quote, risk, and paper-ledger calculations; no LLM output can generate probabilities or authorize trades.
 - Added `GET /decision` as the synchronized source for the minimal dashboard and Windows floating panel, including same-tick consistency checks and fail-closed signal approval.

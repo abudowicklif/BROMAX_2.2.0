@@ -31,6 +31,34 @@ def test_forecast_limit_returns_most_recent_rows_in_chronological_order(tmp_path
     rows=store.forecasts("1HZ100V",limit=2)
     assert [row["forecast_epoch"] for row in rows]==[102,103]
 
+def test_recent_forecasts_returns_signal_fields_in_chronological_order(tmp_path):
+    store=Store(str(tmp_path/"recent_forecasts.db"))
+    for epoch in range(100,103):
+        tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,str(epoch))
+        forecast=Forecast("test","1.0",{},epoch%10,(.1,)*10)
+        store.append_forecast("1HZ100V",forecast,tick,epoch)
+    rows=store.recent_forecasts("1HZ100V",limit=2)
+    assert [row["forecast_epoch"] for row in rows]==[101,102]
+    assert all(row["probabilities"]==[.1]*10 for row in rows)
+
+def test_recent_forecasts_preserves_market_epoch_order_after_late_inserts(tmp_path):
+    store=Store(str(tmp_path/"recent_forecast_epoch_order.db"))
+    for epoch in (104,102,103):
+        tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,str(epoch))
+        store.append_forecast("1HZ100V",Forecast("test","1.0",{},epoch%10,(.1,)*10),tick,epoch)
+    rows=store.recent_forecasts("1HZ100V",limit=2)
+    assert [row["forecast_epoch"] for row in rows]==[103,104]
+
+def test_append_forecasts_inserts_batch_in_strategy_order(tmp_path):
+    store=Store(str(tmp_path/"forecast_batch.db"))
+    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"tick")
+    forecasts=[Forecast(f"strategy_{i}","1.0",{},i,(.1,)*10) for i in range(3)]
+    seqs=store.append_forecasts("1HZ100V",forecasts,tick,100,stake=1,note="PAYOUT_PENDING")
+    rows=store.forecasts("1HZ100V")
+    assert len(seqs)==len(rows)==3
+    assert [row["strategy_id"] for row in rows]==[f"strategy_{i}" for i in range(3)]
+    assert [row["seq"] for row in rows]==seqs
+    assert all(row["forecast_tick_id"]==tick and row["forecast_epoch"]==100 for row in rows)
 
 def test_quote_arriving_after_scoring_is_not_used_as_prediction_time_payout(tmp_path):
     store=Store(str(tmp_path/"late_quote.db"))
@@ -61,6 +89,19 @@ def test_symbol_histories_are_separate(tmp_path):
     store.add_tick("1HZ50V",100,"1.27",2,7,"sub-b")
     assert [r["digit"] for r in store.history("1HZ100V")] == [0]
     assert [r["digit"] for r in store.history("1HZ50V")] == [7]
+
+
+def test_tick_views_use_market_epoch_not_insert_order(tmp_path):
+    store=Store(str(tmp_path/"backfilled_ticks.db"))
+    latest_id=store.add_tick("1HZ100V",102,"1.22",2,2,"live")
+    store.add_tick("1HZ100V",100,"1.20",2,0,"history-1")
+    store.add_tick("1HZ100V",101,"1.21",2,1,"history-2")
+
+    assert [row["epoch"] for row in store.history("1HZ100V")]==[100,101,102]
+    assert [row["epoch"] for row in store.quality_history("1HZ100V")]==[100,101,102]
+    assert store.ticks_frame("1HZ100V")["epoch"].tolist()==[100,101,102]
+    assert store.is_latest_tick("1HZ100V",latest_id)
+
 
 def test_quote_before_next_epoch_is_retained(tmp_path):
     import time

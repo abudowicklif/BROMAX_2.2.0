@@ -5,26 +5,59 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pathlib import Path
 import json
 from threading import Lock
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 from .config import Settings
 from .storage import Store
 from .collector import MarketCollector
-from .paperbot import PaperBot
-from .agents import coordinate_snapshot
+from .paperbot import ExecutionInterface, PaperBot
+from .agents import (
+    DataIntelligenceAgent,
+    ProbabilityCalibrationAgent,
+    StrategyResearchAgent,
+    coordinate_snapshot,
+    select_primary_signal,
+)
 from .reporting import write_report
 from .intelligence import analyze_ticks
 from .timing import evaluate_timing, evaluate_payout_timing
-from .strategies import candidate_strategies, ForecastContext
 from uuid import uuid4
 
 logging.basicConfig(level=logging.INFO)
 settings=Settings.from_env(); store=Store(settings.database_path)
 paperbot=PaperBot(store,settings.paper_stake,settings.max_paper_stake,settings.daily_loss_cap,settings.max_trades_per_day)
+execution_interface=ExecutionInterface()
 collector=MarketCollector(settings,store,paperbot)
 collector_task=None
+primary_analysis_task=None
 _report_cache={"created":0.0,"value":None}
+_primary_report_file_cache={"path":None,"modified_ns":None,"value":None}
 _timing_cache={}
 _report_lock=Lock()
 _timing_lock=Lock()
+_primary_signal_cache={}
+_primary_signal_lock=Lock()
+_primary_analysis_lock=Lock()
+_decision_analysis_lock=Lock()
+_PRIMARY_FULL_ANALYSIS_INTERVAL_SECONDS=60.0
+_PRIMARY_ANALYSIS_POLL_SECONDS=1.0
+_last_primary_full_analysis_at={}
+_primary_analysis_state={
+    symbol:{
+        "status":"WAITING_FOR_DATA",
+        "last_started_at":None,
+        "last_completed_at":None,
+        "last_tick_id":None,
+        "last_checked_tick_id":None,
+        "last_signal_status":None,
+        "last_reason":None,
+        "last_error":None,
+    }
+    for symbol in settings.symbols
+}
+_PIPELINE_FORECAST_COUNT_TTL_SECONDS=60.0
+_pipeline_forecast_count_cache={}
+_pipeline_forecast_count_lock=Lock()
 
 def _auth_credentials():
     username=os.getenv("BROMAX_AUTH_USERNAME")
@@ -35,18 +68,298 @@ def _auth_credentials():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global collector_task
+    global collector_task, primary_analysis_task
     auth_required=os.getenv("BROMAX_REQUIRE_AUTH","").lower() in {"1","true","yes"}
     username,password=_auth_credentials()
     if auth_required and not username:
         raise RuntimeError("BROMAX_REQUIRE_AUTH is enabled but authentication credentials are not configured")
     collector_task=asyncio.create_task(collector.run_forever())
-    yield
-    collector_task.cancel()
-    try: await collector_task
-    except asyncio.CancelledError: pass
+    primary_analysis_task=asyncio.create_task(_primary_signal_worker())
+    try:
+        yield
+    finally:
+        tasks=[task for task in (primary_analysis_task,collector_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
 
 app=FastAPI(title="BROMAX MATCH Research",version="2.2.0",lifespan=lifespan)
+
+def _market_feed_is_fresh(symbol, now=None):
+    received=collector.last_received.get(symbol)
+    if received is None:
+        return False
+    age=(time.time() if now is None else now)-received
+    return -1<=age<=settings.max_data_age_seconds
+
+def _set_primary_analysis_state(symbol,status,**updates):
+    with _primary_analysis_lock:
+        state=_primary_analysis_state.setdefault(symbol,{})
+        state.update(status=status,updated_at=datetime.now(timezone.utc).isoformat(),**updates)
+
+def _primary_analysis_snapshot():
+    with _primary_analysis_lock:
+        return {symbol:dict(state) for symbol,state in _primary_analysis_state.items()}
+
+def _primary_failure_reason(primary):
+    reasons=[str(reason) for reason in primary.get("reasons") or []]
+    return next(
+        (reason for reason in reasons if not reason.startswith("Required analysis is not ready")),
+        reasons[0] if reasons else None,
+    )
+
+def _load_primary_report_item(symbol):
+    report_path=Path(__file__).resolve().parent.parent/"reports"/"bromax_report.json"
+    with _report_lock:
+        report_data=_report_cache["value"]
+        report_is_fresh=(
+            report_data is not None
+            and time.monotonic()-_report_cache["created"]<15
+        )
+        if not report_is_fresh:
+            if not report_path.is_file():
+                return None
+            modified_ns=report_path.stat().st_mtime_ns
+            if (
+                _primary_report_file_cache["path"]==str(report_path)
+                and _primary_report_file_cache["modified_ns"]==modified_ns
+            ):
+                report_data=_primary_report_file_cache["value"]
+            else:
+                report_data=json.loads(report_path.read_text(encoding="utf-8"))
+                _primary_report_file_cache.update(
+                    path=str(report_path),modified_ns=modified_ns,value=report_data
+                )
+    return next(
+        (item for item in report_data.get("symbols",[]) if item.get("symbol")==symbol),
+        {},
+    )
+
+def _publish_blocked_primary(
+    symbol,signal_data,agent_results,status,worker_status="NO_QUALIFIED_SIGNAL"
+):
+    tick_id=signal_data.get("observed_tick_id")
+    epoch=signal_data.get("observed_epoch")
+    primary=select_primary_signal(
+        signal_data,
+        [result.as_dict() for result in agent_results],
+        {
+            "status":status,
+            "selection_ready":False,
+            "snapshot_tick_id":tick_id,
+            "snapshot_epoch":epoch,
+        },
+    )
+    with _primary_signal_lock:
+        _primary_signal_cache[symbol]=primary
+    _set_primary_analysis_state(
+        symbol,
+        worker_status,
+        last_completed_at=datetime.now(timezone.utc).isoformat(),
+        last_tick_id=tick_id,
+        last_checked_tick_id=tick_id,
+        last_signal_status=primary["status"],
+        last_reason=_primary_failure_reason(primary),
+        last_error=None,
+    )
+    return True
+
+def _run_primary_analysis_once(symbol):
+    tick_id=None
+    full_analysis_started=False
+    try:
+        signal_data=collector.signal_snapshot(symbol)
+        if not _market_feed_is_fresh(symbol):
+            _set_primary_analysis_state(
+                symbol,"WAITING_FOR_DATA",last_reason="Waiting for fresh live market data."
+            )
+            return False
+        if signal_data.get("status") in {"analysis_pending","insufficient_history"}:
+            _set_primary_analysis_state(
+                symbol,
+                "ANALYSIS_PENDING",
+                last_tick_id=signal_data.get("observed_tick_id"),
+                last_reason="Waiting for a complete strategy forecast batch.",
+            )
+            return False
+
+        tick_id=signal_data.get("observed_tick_id")
+        with _primary_analysis_lock:
+            if _primary_analysis_state.get(symbol,{}).get("last_checked_tick_id")==tick_id:
+                return False
+        _set_primary_analysis_state(
+            symbol,
+            "ANALYZING",
+            last_started_at=datetime.now(timezone.utc).isoformat(),
+            last_tick_id=tick_id,
+            last_checked_tick_id=tick_id,
+            last_reason=None,
+            last_error=None,
+        )
+        quality_ticks=store.quality_history(symbol,21)
+        data_result=DataIntelligenceAgent().run(
+            quality_ticks,
+            feed_stale=not _market_feed_is_fresh(symbol),
+            max_age_seconds=settings.max_data_age_seconds,
+            errors=collector.errors,
+        )
+        if data_result.status!="APPROVED":
+            return _publish_blocked_primary(
+                symbol,signal_data,[data_result],"DATA_QUALITY_BLOCKED"
+            )
+
+        report_item=_load_primary_report_item(symbol)
+        if report_item is None:
+            _set_primary_analysis_state(
+                symbol,
+                "WAITING_FOR_RESEARCH_REPORT",
+                last_completed_at=datetime.now(timezone.utc).isoformat(),
+                last_tick_id=tick_id,
+                last_checked_tick_id=tick_id,
+                last_reason="No saved research report is available; full report generation is not run in the background.",
+            )
+            return True
+        research_result=StrategyResearchAgent().run(report_item)
+        if research_result.status!="APPROVED":
+            return _publish_blocked_primary(
+                symbol,
+                signal_data,
+                [data_result,research_result],
+                "RESEARCH_NOT_APPROVED",
+            )
+
+        strategy_id=research_result.metrics.get("selected_strategy_id")
+        model=next(
+            (
+                row for row in signal_data.get("signals",[])
+                if isinstance(row,dict) and row.get("strategy_id")==strategy_id
+            ),
+            None,
+        )
+        probabilities=(model or {}).get("probabilities") or []
+        evidence_rows=(report_item.get("digit_evidence") or {}).get("digits") or []
+        evidence_by_digit={int(row["digit"]):row for row in evidence_rows}
+        digit_analysis={"digits":[
+            {
+                "digit":digit,
+                "estimated_win_probability":probabilities[digit] if len(probabilities)==10 else None,
+                "health_percent":evidence_by_digit.get(digit,{}).get("health_score"),
+                "validation":evidence_by_digit.get(digit,{}).get("validation") or {},
+            }
+            for digit in range(10)
+        ]}
+        probability_result=ProbabilityCalibrationAgent().run(digit_analysis,signal_data)
+        if probability_result.status!="APPROVED":
+            return _publish_blocked_primary(
+                symbol,
+                signal_data,
+                [data_result,research_result,probability_result],
+                "PROBABILITY_CHECK_BLOCKED",
+            )
+
+        latest=collector.signal_snapshot(symbol)
+        if (
+            latest.get("status") in {"analysis_pending","insufficient_history"}
+            or latest.get("observed_tick_id")!=tick_id
+            or latest.get("observed_epoch")!=signal_data.get("observed_epoch")
+            or not _market_feed_is_fresh(symbol)
+        ):
+            _set_primary_analysis_state(
+                symbol,
+                "STALE_RESULT",
+                last_completed_at=datetime.now(timezone.utc).isoformat(),
+                last_tick_id=tick_id,
+                last_reason="The live tick changed during background qualification; result discarded.",
+            )
+            return False
+
+        with _primary_analysis_lock:
+            last_full_analysis=_last_primary_full_analysis_at.get(symbol)
+            now_monotonic=time.monotonic()
+            if (
+                last_full_analysis is not None
+                and now_monotonic-last_full_analysis<_PRIMARY_FULL_ANALYSIS_INTERVAL_SECONDS
+            ):
+                full_analysis_throttled=True
+            else:
+                _last_primary_full_analysis_at[symbol]=now_monotonic
+                full_analysis_throttled=False
+        if full_analysis_throttled:
+            return _publish_blocked_primary(
+                symbol,
+                signal_data,
+                [data_result,research_result,probability_result],
+                "FULL_ANALYSIS_THROTTLED",
+                worker_status="THROTTLED",
+            )
+
+        full_analysis_started=True
+        decision=unified_decision(symbol)
+        with _primary_analysis_lock:
+            _last_primary_full_analysis_at[symbol]=time.monotonic()
+        primary=decision["primary_signal"]
+        current=collector.signal_snapshot(symbol)
+        still_current=(
+            current.get("status") not in {"analysis_pending","insufficient_history"}
+            and _market_feed_is_fresh(symbol)
+            and primary.get("observed_tick_id")==current.get("observed_tick_id")
+            and primary.get("observed_epoch")==current.get("observed_epoch")
+        )
+        if not still_current:
+            status="STALE_RESULT"
+            reason="The live tick changed during background qualification; result is not current."
+        else:
+            status="QUALIFIED" if primary["status"]=="QUALIFIED" else "NO_QUALIFIED_SIGNAL"
+            reason=_primary_failure_reason(primary)
+        _set_primary_analysis_state(
+            symbol,
+            status,
+            last_completed_at=datetime.now(timezone.utc).isoformat(),
+            last_tick_id=primary.get("observed_tick_id"),
+            last_checked_tick_id=tick_id,
+            last_signal_status=primary.get("status"),
+            last_reason=reason,
+            last_error=None,
+        )
+        return True
+    except Exception as error:
+        logging.getLogger("bromax.primary").exception(
+            "Background primary analysis failed for %s",symbol
+        )
+        if full_analysis_started:
+            with _primary_analysis_lock:
+                _last_primary_full_analysis_at[symbol]=time.monotonic()
+        _set_primary_analysis_state(
+            symbol,
+            "ERROR",
+            last_completed_at=datetime.now(timezone.utc).isoformat(),
+            last_tick_id=tick_id,
+            last_checked_tick_id=tick_id,
+            last_reason="Background primary analysis failed.",
+            last_error=str(error),
+        )
+        return True
+
+async def _primary_signal_worker():
+    while True:
+        for symbol in settings.symbols:
+            try:
+                await asyncio.to_thread(_run_primary_analysis_once,symbol)
+            except Exception as error:
+                logging.getLogger("bromax.primary").exception(
+                    "Background primary worker failed for %s",symbol
+                )
+                _set_primary_analysis_state(
+                    symbol,
+                    "ERROR",
+                    last_completed_at=datetime.now(timezone.utc).isoformat(),
+                    last_reason="Background primary worker failed.",
+                    last_error=str(error),
+                )
+        await asyncio.sleep(_PRIMARY_ANALYSIS_POLL_SECONDS)
 
 @app.middleware("http")
 async def require_basic_auth(request, call_next):
@@ -79,16 +392,65 @@ def health():
         counts={s:c.execute("SELECT COUNT(*) FROM ticks WHERE symbol=?",(s,)).fetchone()[0] for s in settings.symbols}
         latest={}
         for s in settings.symbols:
-            r=c.execute("SELECT epoch,quote_text,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT 1",(s,)).fetchone()
+            r=c.execute("SELECT epoch,quote_text,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT 1",(s,)).fetchone()
             latest[s]=dict(r) if r else None
-    stale={s:(collector.last_received.get(s) is None or time.time()-collector.last_received[s]>settings.max_data_age_seconds) for s in settings.symbols}
-    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"recent_errors":collector.errors[-10:]}
+    stale={s:not _market_feed_is_fresh(s) for s in settings.symbols}
+    pipeline={s:_pipeline_state(s,stored_ticks=counts[s]) for s in settings.symbols}
+    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"pipeline":pipeline,"primary_analysis":_primary_analysis_snapshot(),"recent_errors":collector.errors[-10:]}
+
+@app.get("/performance")
+def performance():
+    return {
+        "symbols":{
+            symbol:{
+                "connection_status":collector.connection_status,
+                "pipeline":collector.operational_status(symbol),
+            }
+            for symbol in settings.symbols
+        },
+        "timing_source":"local monotonic clock; tick-to-forecast excludes Deriv network transit",
+    }
+
+def _stored_forecast_count(symbol):
+    now=time.monotonic()
+    with _pipeline_forecast_count_lock:
+        cached=_pipeline_forecast_count_cache.get(symbol)
+        if cached and now-cached[0] < _PIPELINE_FORECAST_COUNT_TTL_SECONDS:
+            return cached[1]
+        with store.connect() as c:
+            count=c.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE symbol=? AND event_type='FORECAST'",(symbol,)
+            ).fetchone()[0]
+        _pipeline_forecast_count_cache[symbol]=(now,count)
+        return count
+
+def _pipeline_state(symbol,stored_ticks=None):
+    state=collector.operational_status(symbol)
+    state["recent_errors"]=collector.errors[-5:]
+    if stored_ticks is None:
+        with store.connect() as c:
+            stored_ticks=c.execute("SELECT COUNT(*) FROM ticks WHERE symbol=?",(symbol,)).fetchone()[0]
+    state["stored_ticks"]=stored_ticks
+    state["stored_forecasts"]=_stored_forecast_count(symbol)
+    return state
+
+@app.post("/safety/kill-switch")
+def engage_execution_kill_switch():
+    """Engage the one-way live-execution kill switch; never enables orders."""
+    execution_interface.engage_kill_switch()
+    logging.getLogger("bromax.safety").warning("Execution kill switch engaged")
+    return {
+        "status":"KILL_SWITCH_ENGAGED",
+        "kill_switch_engaged":execution_interface.kill_switch_engaged,
+        "live_execution_implemented":False,
+        "live_execution_enabled":False,
+    }
 
 @app.get("/ticks/latest")
 def latest_ticks(symbol: str, limit: int=50):
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
     with store.connect() as c:
-        rows=c.execute("SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",(symbol,max(1,min(limit,1000)))).fetchall()
+        rows=c.execute("SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT ?",(symbol,max(1,min(limit,1000)))).fetchall()
     return [dict(r) for r in rows]
 
 @app.get("/digits/distribution")
@@ -104,6 +466,48 @@ def forecasts(symbol: str, limit: int = 500):
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
     if limit < 1 or limit > 5000: raise HTTPException(422,"limit must be between 1 and 5000")
     return store.forecasts(symbol,limit=limit)
+
+@app.get("/signals/history")
+def signal_history(symbol: str, limit: int = 50):
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    if limit < 1 or limit > 500:
+        raise HTTPException(422,"limit must be between 1 and 500")
+    rows=store.recent_forecasts(symbol,limit=limit)
+    latest=store.quality_history(symbol,1)
+    latest_epoch=int(latest[-1]["epoch"]) if latest else None
+    status=_pipeline_state(symbol)
+    now=time.time()
+    current_feed=(
+        collector.last_received.get(symbol) is not None
+        and now-collector.last_received[symbol]<=settings.max_data_age_seconds
+    )
+    signals=[]
+    for row in rows:
+        actual=row.get("actual_digit")
+        if actual is not None:
+            signal_status="SCORED_HIT" if row.get("hit") else "SCORED_MISS"
+        elif current_feed and int(row["forecast_epoch"])==latest_epoch:
+            signal_status="CURRENT"
+        else:
+            signal_status="EXPIRED_UNSCORED"
+        probabilities=row.get("probabilities") or []
+        prediction=int(row["prediction"])
+        confidence=probabilities[prediction] if prediction<len(probabilities) else None
+        signals.append({
+            "symbol":symbol,
+            "strategy_id":row["strategy_id"],
+            "prediction":prediction,
+            "confidence":confidence,
+            "forecast_epoch":int(row["forecast_epoch"]),
+            "target_epoch":int(row["forecast_epoch"])+1,
+            "created_at":row["created_utc"],
+            "status":signal_status,
+            "actual_digit":actual,
+            "hit":row.get("hit"),
+        })
+    return {"symbol":symbol,"pipeline":status,"signals":signals,"trade_authorized":False,
+            "note":"Persisted strategy forecasts are analysis records, not trade instructions. CURRENT applies only to the freshest tick while the live feed is fresh."}
 
 @app.get("/report")
 def report():
@@ -513,6 +917,15 @@ def digit_analysis(symbol: str):
 
 @app.get("/decision")
 def unified_decision(symbol: str):
+    """Return one timestamped decision without overlapping background analysis."""
+    if not _decision_analysis_lock.acquire(blocking=False):
+        raise HTTPException(503,"Decision analysis is already running; retry after it completes.")
+    try:
+        return _unified_decision_snapshot(symbol)
+    finally:
+        _decision_analysis_lock.release()
+
+def _unified_decision_snapshot(symbol: str):
     """Return one timestamped, internally checked paper-only decision snapshot."""
     from datetime import datetime, timezone
     if symbol not in settings.symbols:
@@ -561,6 +974,8 @@ def unified_decision(symbol: str):
         consistent=consistent,
         snapshot_timestamp=snapshot_timestamp,
     )
+    with _primary_signal_lock:
+        _primary_signal_cache[symbol]=coordinated["primary_signal"]
     decision_data=coordinated["decision"]
     risk_result=next(item for item in coordinated["agents"] if item["agent_id"]=="risk_signal_approval")
     approved_signal=decision_data.get("signal") if decision_data.get("trade_authorized") else None
@@ -599,6 +1014,7 @@ def unified_decision(symbol: str):
         })
     data_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="data_intelligence")
     regime_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="market_regime")
+    pipeline=_pipeline_state(symbol)
     return {
         "snapshot_id":snapshot_id,
         "created_at":snapshot_timestamp,
@@ -613,11 +1029,17 @@ def unified_decision(symbol: str):
         "signal":approved_signal,
         "reasons":risk_result["reasons"],
         "market_status":{
-            "connected":not feed_stale,
+            "connected":pipeline["connection_status"]=="CONNECTED",
+            "connection_status":pipeline["connection_status"],
+            "subscription_status":pipeline["subscription_status"],
+            "data_status":pipeline["data_status"],
+            "pipeline_status":pipeline["pipeline_status"],
+            "receiving_data":pipeline["data_status"]=="RECEIVING DATA",
             "data_quality_status":data_agent["status"],
             "freshness_seconds":data_agent["metrics"].get("latest_tick_age_seconds"),
             "latest_tick":final_tick[-1] if final_tick else None,
         },
+        "pipeline":pipeline,
         "digits":digit_predictions,
         "volatility":{
             "condition":regime_agent["metrics"].get("current_regime"),
@@ -626,6 +1048,8 @@ def unified_decision(symbol: str):
         },
         "agents":coordinated["agents"],
         "performance":coordinated["performance"],
+        "coordination":coordinated["coordination"],
+        "primary_signal":coordinated["primary_signal"],
         "agent_run_persisted":persisted,
     }
 
@@ -633,24 +1057,43 @@ def unified_decision(symbol: str):
 def signals(symbol: str):
     """Current candidate forecasts for inspection only; never a trade authorization."""
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
-    history=store.history(symbol,limit=1000)
-    if len(history) < settings.min_history_ticks:
-        return {"symbol":symbol,"status":"insufficient_history","required_ticks":settings.min_history_ticks,"observed_ticks":len(history),"signals":[],"trade_authorized":False}
-    digits=tuple(int(r["digit"]) for r in history)
-    counts=store.digit_counts(symbol)
-    latest=history[-1]
-    context=ForecastContext(symbol,int(latest["id"]),int(latest["epoch"]),digits,tuple(int(x) for x in counts))
-    forecasts=[strategy.forecast(context) for strategy in candidate_strategies()]
-    output=[]
-    for f in forecasts:
-        output.append({"strategy_id":f.strategy_id,"version":f.version,"parameters":f.parameters,
-                       "predicted_digit":f.prediction,"predicted_digit_probability":f.probabilities[f.prediction],
-                       "probabilities":list(f.probabilities),"history_support":len(digits),
-                       "status":"RESEARCH_ONLY_NOT_APPROVED"})
-    output.sort(key=lambda x:x["predicted_digit_probability"],reverse=True)
-    return {"symbol":symbol,"observed_tick_id":int(latest["id"]),"observed_epoch":int(latest["epoch"]),
-            "signals":output,"trade_authorized":False,
-            "note":"Ranking is descriptive only. It is not a calibrated confidence score and does not bypass validation, quote, or paper-risk gates."}
+    try:
+        return collector.signal_snapshot(symbol)
+    except KeyError:
+        raise HTTPException(404,"Symbol not configured")
+
+@app.get("/signals/primary")
+def primary_signal(symbol: str):
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    current=collector.signal_snapshot(symbol)
+    feed_fresh=_market_feed_is_fresh(symbol)
+    with _primary_signal_lock:
+        cached=_primary_signal_cache.get(symbol)
+    matches_latest=(
+        cached is not None
+        and current.get("status") != "analysis_pending"
+        and cached.get("observed_tick_id")==current.get("observed_tick_id")
+        and cached.get("observed_epoch")==current.get("observed_epoch")
+    )
+    if feed_fresh and matches_latest:
+        return cached
+    if not feed_fresh:
+        reason_status="STALE_MARKET_DATA"
+    elif current.get("status")=="analysis_pending":
+        reason_status="ANALYSIS_PENDING"
+    else:
+        reason_status="AGENT_ANALYSIS_NOT_AVAILABLE"
+    return select_primary_signal(
+        current,
+        [],
+        {
+            "status":reason_status,
+            "selection_ready":False,
+            "snapshot_tick_id":current.get("observed_tick_id"),
+            "snapshot_epoch":current.get("observed_epoch"),
+        },
+    )
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():

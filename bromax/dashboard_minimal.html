@@ -6,7 +6,8 @@
 <title>BROMAX — Decision Terminal</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.status.warn{color:var(--amber)}.status.warn .light{background:var(--amber)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}.ops-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.ops-grid .value{font-size:13px}.history-wrap{overflow:auto;max-height:230px;margin-top:8px}.history-table{min-width:600px}.last-error{margin:8px 0 0;color:var(--red);overflow-wrap:anywhere}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
+ .trade-pill.pending{color:var(--amber);border-color:#816c3d;background:#2c281e}.trade-pill.research{color:var(--blue);border-color:#496b58;background:#18242a}
 </style>
 </head>
 <body>
@@ -17,146 +18,229 @@
     <div class="market">
       <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
       <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
-      <div class="market-item"><span class="label">Latest tick · last digit</span><strong class="value" id="latestTick">—</strong></div>
+      <div class="market-item"><span class="label">Latest tick · digit · market time</span><strong class="value" id="latestTick">—</strong></div>
       <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
     </div>
   </section>
 
   <section class="section signal" aria-labelledby="signal-heading">
-    <div class="section-title"><h2 id="signal-heading">Best trading signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
+    <div class="section-title"><h2 id="signal-heading">Primary research signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
     <div class="signal-grid">
-      <div class="signal-primary"><span class="label">Recommended digit</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
-      <div class="signal-item"><span class="label">Win probability</span><strong class="value" id="signalProbability">—</strong></div>
-      <div class="signal-item"><span class="label">Health</span><strong class="value" id="signalHealth">—</strong></div>
-      <div class="signal-item"><span class="label">Duration</span><strong class="value" id="signalDuration">—</strong></div>
-      <div class="signal-item"><span class="label">Quoted payout</span><strong class="value" id="signalPayout">—</strong></div>
-      <div class="signal-item"><span class="label">Expected value</span><strong class="value" id="signalEv">—</strong></div>
+      <div class="signal-primary"><span class="label">Qualified digit · research only</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
+      <div class="signal-item"><span class="label">Model probability · uncalibrated</span><strong class="value" id="signalProbability">—</strong></div>
+      <div class="signal-item"><span class="label">Strategy</span><strong class="value" id="signalHealth">—</strong></div>
+      <div class="signal-item"><span class="label">Target tick</span><strong class="value" id="signalDuration">—</strong></div>
+      <div class="signal-item"><span class="label">Execution</span><strong class="value" id="signalPayout">DISABLED</strong></div>
+      <div class="signal-item"><span class="label">Signal status</span><strong class="value" id="signalEv">NO SIGNAL</strong></div>
     </div>
+    <p class="note" id="primaryReason">A primary digit appears only when a current-tick agent result passes research gates. No signal is forced and no trade is placed.</p>
+  </section>
+
+  <section class="section" aria-labelledby="pipeline-heading">
+    <div class="section-title"><h2 id="pipeline-heading">Live analysis pipeline</h2><strong class="status" id="pipelineStatus"><i class="light"></i><span>WAITING</span></strong></div>
+    <div class="ops-grid">
+      <div><span class="label">Subscription</span><strong class="value" id="subscriptionStatus">—</strong></div>
+      <div><span class="label">Analysis engine</span><strong class="value" id="analysisStatus">—</strong></div>
+      <div><span class="label">Strategy processing</span><strong class="value" id="strategyStatus">—</strong></div>
+      <div><span class="label">Signal generation</span><strong class="value" id="generationStatus">—</strong></div>
+      <div><span class="label">Last primary analysis</span><strong class="value" id="primaryAnalysisStatus">WAITING FOR DATA</strong></div>
+      <div><span class="label">Ticks received / processed</span><strong class="value" id="tickCounts">—</strong></div>
+      <div><span class="label">Forecasts generated</span><strong class="value" id="signalsRecorded">—</strong></div>
+      <div><span class="label">Missed tick epochs</span><strong class="value" id="missingTicks">—</strong></div>
+      <div><span class="label">Out-of-order / invalid / duplicate</span><strong class="value" id="badTicks">—</strong></div>
+    </div>
+    <p class="last-error" id="pipelineError" hidden></p>
+    <p class="note">Live ticks are analyzed independently of trading. No order is placed.</p>
   </section>
 
   <section class="section" aria-labelledby="digits-heading">
-    <div class="section-title"><h2 id="digits-heading">Digit prediction · all ten digits</h2><span class="muted" id="decisionNote">Estimates are shown only when calculated.</span></div>
+    <div class="section-title"><h2 id="digits-heading">Strategy forecasts · latest tick</h2><span class="muted" id="decisionNote">All candidates are research-only; probabilities are not calibrated confidence.</span></div>
     <div class="digit-wrap"><table>
-      <thead><tr><th>Digit</th><th>Win probability</th><th>Evidence health</th><th>Decision</th><th>Rejection reason</th></tr></thead>
-      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for research data.</td></tr></tbody>
+      <thead><tr><th>Strategy</th><th>Digit</th><th>Model probability</th><th>Classification</th><th>Trading</th></tr></thead>
+      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for live strategy forecasts.</td></tr></tbody>
     </table></div>
   </section>
 
-  <div class="bottom">
-    <section class="section" aria-labelledby="volatility-heading">
-      <div class="section-title"><h2 id="volatility-heading">Volatility check</h2></div>
-      <div class="summary-grid">
-        <div><span class="label">Current condition</span><strong class="value" id="volatilityCondition">—</strong></div>
-        <div><span class="label">Volatility health</span><strong class="value" id="volatilityHealth">—</strong></div>
-        <div><span class="label">Signal filter</span><strong class="value" id="volatilityApproval">—</strong></div>
-      </div>
-    </section>
-    <section class="section" aria-labelledby="paper-heading">
-      <div class="section-title"><h2 id="paper-heading">Paper trading results</h2></div>
-      <div class="summary-grid">
-        <div><span class="label">Total trades</span><strong class="value" id="tradeTotal">0</strong></div>
-        <div><span class="label">Wins</span><strong class="value" id="tradeWins">0</strong></div>
-        <div><span class="label">Losses</span><strong class="value" id="tradeLosses">0</strong></div>
-        <div><span class="label">Win rate</span><strong class="value" id="tradeWinRate">—</strong></div>
-        <div><span class="label">Net paper profit</span><strong class="value" id="tradeProfit">—</strong></div>
-      </div>
-    </section>
-  </div>
+  <section class="section" aria-labelledby="history-heading">
+    <div class="section-title"><h2 id="history-heading">Forecast history · highest-probability candidate per tick</h2><span class="updated" id="historyUpdated">Waiting for history</span></div>
+    <div class="history-wrap"><table class="history-table">
+      <thead><tr><th>Market time</th><th>Strategy</th><th>Forecast digit</th><th>Model probability</th><th>Outcome</th></tr></thead>
+      <tbody id="signalHistory"><tr><td colspan="5" class="muted">No persisted forecasts yet.</td></tr></tbody>
+    </table></div>
+    <p class="note">This table is strategy-forecast history, not qualified primary-signal history. One highest-probability candidate is shown per tick; outcomes are recorded only when the exact next tick is observed.</p>
+  </section>
 </main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
-const state={symbol:$('symbol').value,currency:'USD'};
+const state={symbol:$('symbol').value};
+const historyCache=new Map();
+const HISTORY_REFRESH_MS=30000;
 const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
-const score=value=>value==null||!Number.isFinite(Number(value))?'—':`${Number(value)}%`;
-const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:state.currency,maximumFractionDigits:2}).format(Number(value));
 const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
 function renderMarket(decision){
-  const symbol=decision.symbol,market=decision.market_status||{},tick=market.latest_tick;
-  state.currency=decision.currency||'USD';
+  const symbol=decision.symbol,market=decision.market_status||{},pipeline=decision.pipeline||{},tick=market.latest_tick;
   $('marketSymbol').textContent=symbol;
-  const connected=Boolean(market.connected);
-  const connection=$('connection');connection.className=`status ${connected?'good':'bad'}`;
-  connection.querySelector('span').textContent=connected?'CONNECTED':'STALE / NOT APPROVED';
+  const receiving=market.data_status==='RECEIVING DATA';
+  const statusText=market.connection_status||'DISCONNECTED';
+  const connection=$('connection');
+  connection.className=`status ${statusText==='CONNECTED'?(receiving?'good':'warn'):statusText==='CONNECTING'||statusText==='RECONNECTING'?'warn':'bad'}`;
+  connection.querySelector('span').textContent=statusText;
   if(tick){
     const age=market.freshness_seconds;
-    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
-    $('freshness').textContent=`${connected?'FRESH':'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
-    $('freshness').className=`value ${connected?'good-text':'bad-text'}`;
+    const tickTime=tick.epoch?new Date(Number(tick.epoch)*1000).toLocaleTimeString():'—';
+    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit} · ${tickTime}`;
+    $('freshness').textContent=`${market.data_status||'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
+    $('freshness').className=`value ${receiving?'good-text':'bad-text'}`;
   }else{
     $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
   }
+  const pipelineStatus=$('pipelineStatus');
+  const pipelineText=pipeline.pipeline_status||'WAITING';
+  const good=pipelineText==='GENERATING SIGNALS'||pipelineText==='ANALYZING'||pipelineText==='RECEIVING DATA';
+  const warn=pipelineText==='CONNECTED'||pipelineText==='CONNECTING';
+  pipelineStatus.className=`status ${good?'good':warn?'warn':'bad'}`;
+  pipelineStatus.querySelector('span').textContent=pipelineText;
+  $('subscriptionStatus').textContent=pipeline.subscription_status||'—';
+  $('analysisStatus').textContent=pipeline.analysis_status||'—';
+  $('strategyStatus').textContent=pipeline.strategy_status||'—';
+  $('generationStatus').textContent=pipeline.signal_generation_status||'—';
+  const primaryAnalysis=decision.primary_analysis||{};
+  const primaryStatus=$('primaryAnalysisStatus');
+  const analysisStatus=primaryAnalysis.status||'WAITING_FOR_DATA';
+  const analysisTick=primaryAnalysis.last_tick_id;
+  const completedStatus=['QUALIFIED','NO_QUALIFIED_SIGNAL','STALE_RESULT'].includes(analysisStatus);
+  primaryStatus.textContent=completedStatus&&analysisTick
+    ?`${analysisStatus} · TICK ${analysisTick}`
+    :analysisStatus;
+  primaryStatus.className=`value ${primaryAnalysis.status==='QUALIFIED'?'good-text':primaryAnalysis.status==='ERROR'||primaryAnalysis.status==='STALE_RESULT'?'bad-text':'warn-text'}`;
+  $('tickCounts').textContent=`${pipeline.received_ticks??0} / ${pipeline.processed_ticks??0}`;
+  $('signalsRecorded').textContent=String(pipeline.signals_generated??0);
+  $('missingTicks').textContent=String(pipeline.missing_tick_count??0);
+  $('badTicks').textContent=`${pipeline.out_of_order_ticks??0} / ${pipeline.invalid_ticks??0} / ${pipeline.duplicate_ticks??0}`;
+  const error=$('pipelineError');
+  error.textContent=pipeline.last_error||pipeline.connection_error||'';
+  error.hidden=!error.textContent;
 }
-function renderSignal(decision){
-  const signal=decision?.trade_authorized===true?decision.signal:null;
+function renderSignalHistory(data,fetchedAt){
+  const candidates=data?.signals||[];
+  const latestByEpoch=new Map();
+  for(const row of candidates){
+    const epoch=Number(row.forecast_epoch);
+    const previous=latestByEpoch.get(epoch);
+    if(!previous||Number(row.confidence??-1)>Number(previous.confidence??-1))latestByEpoch.set(epoch,row);
+  }
+  const rows=Array.from(latestByEpoch.values()).sort((left,right)=>right.forecast_epoch-left.forecast_epoch).slice(0,10);
+  $('signalHistory').innerHTML=rows.length?rows.map(row=>{
+    const time=row.forecast_epoch?new Date(Number(row.forecast_epoch)*1000).toLocaleTimeString():'—';
+    const outcome=row.status==='SCORED_HIT'?`HIT · ${row.actual_digit}`:row.status==='SCORED_MISS'?`MISS · ${row.actual_digit}`:row.status;
+    return `<tr><td class="num">${safe(time)}</td><td>${safe(row.strategy_id)}</td><td class="num">${safe(row.prediction)}</td><td class="num">${pct(row.confidence)}</td><td>${safe(outcome)}</td></tr>`;
+  }).join(''):'<tr><td colspan="5" class="muted">No persisted forecasts yet.</td></tr>';
+  $('historyUpdated').textContent=fetchedAt?`Updated ${new Date(fetchedAt).toLocaleTimeString()}`:'Waiting for history';
+}
+function renderSignal(signal,analysis){
   const status=$('signalStatus'),hero=$('signalDigit');
-  if(!signal){
-    status.className='trade-pill no-trade';status.textContent='NO TRADE';
-    hero.className='signal-digit empty';hero.textContent='NO QUALIFIED SIGNAL';
-    for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
+  const reasons=Array.isArray(signal?.reasons)?signal.reasons:[];
+  const qualified=signal?.status==='QUALIFIED'&&signal?.trade_authorized===false;
+  const stale=signal?.status==='STALE_MARKET_DATA'||reasons.some(reason=>/stale_market_data|stale market data/i.test(String(reason)));
+  if(!qualified){
+    const analysisStatus=analysis?.status;
+    const analyzing=analysisStatus==='ANALYZING';
+    const pending=analysisStatus==='ANALYSIS_PENDING'||analysisStatus==='WAITING_FOR_DATA';
+    status.className=`trade-pill ${stale||pending||analyzing?'pending':'no-trade'}`;
+    status.textContent=stale?'STALE MARKET DATA':analyzing?'ANALYSIS IN PROGRESS':pending?'ANALYSIS PENDING':analysisStatus==='ERROR'?'ANALYSIS ERROR':'NO QUALIFIED SIGNAL';
+    hero.className='signal-digit empty';
+    hero.textContent=stale?'STALE MARKET DATA':analyzing?'ANALYSIS IN PROGRESS':pending?'ANALYSIS PENDING':'NO QUALIFIED SIGNAL';
+    for(const id of ['signalProbability','signalHealth','signalDuration'])$(id).textContent='—';
+    $('signalPayout').textContent='DISABLED';$('signalEv').textContent='NO SIGNAL';
+    $('primaryReason').textContent=analysisStatus==='ANALYZING'
+      ?'Agent checks are running in the background. No digit is shown until they complete.'
+      :analysis?.last_error||analysis?.last_reason||reasons[0]||'Current-tick research gates have not qualified a primary digit.';
     return;
   }
-  status.className='trade-pill trade';status.textContent='TRADE · PAPER ONLY';
-  hero.className='signal-digit';hero.textContent=String(signal.predicted_digit);
-  $('signalProbability').textContent=pct(signal.probability);
-  const digit=decision.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit));
-  $('signalHealth').textContent=score(digit?.health_percent);
-  $('signalDuration').textContent=`${signal.duration} tick${Number(signal.duration)===1?'':'s'}`;
-  $('signalPayout').textContent=money(signal.payout);
-  $('signalEv').textContent=money(signal.expected_value);
+  status.className='trade-pill research';status.textContent='QUALIFIED · RESEARCH ONLY';
+  hero.className='signal-digit';hero.textContent=String(signal.digit);
+  $('signalProbability').textContent=pct(signal.model_probability);
+  $('signalHealth').textContent=signal.strategy_id;
+  $('signalDuration').textContent=signal.target_epoch?new Date(Number(signal.target_epoch)*1000).toLocaleTimeString():'NEXT TICK';
+  $('signalPayout').textContent='DISABLED';$('signalEv').textContent='NOT A TRADE';
+  $('primaryReason').textContent='Research qualification only. Probabilities are uncalibrated; no order is placed.';
 }
 function renderDigits(decision){
-  const rows=decision?.digits||[];
-  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>{
-    const row=rows.find(item=>Number(item.digit)===digit);
-    if(!row)return `<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">Research data unavailable.</td></tr>`;
-    const approved=row.decision==='TRADE';
-    const reason=(row.reasons||[]).join(' ');
-    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason||'No qualifying per-digit evidence.')}</td></tr>`;
-  }).join('');
-}
-function renderVolatility(decision){
-  const data=decision?.volatility||{};
-  $('volatilityCondition').textContent=data.condition||'INSUFFICIENT DATA';
-  $('volatilityHealth').textContent=score(data.health_percent);
-  const passed=data.status==='APPROVED';
-  const approval=$('volatilityApproval');
-  approval.textContent=passed?'PASS':data.status==='INSUFFICIENT_EVIDENCE'?'INSUFFICIENT DATA':'FAIL';
-  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT_EVIDENCE'?'warn-text':'bad-text'}`;
-}
-function renderPaper(performance){
-  const total=Number(performance?.paper_opened||0);
-  const wins=Number(performance?.wins||0),losses=Number(performance?.losses||0);
-  const settled=Number(performance?.paper_settled||0),profit=performance?.net_paper_profit;
-  $('tradeTotal').textContent=total.toLocaleString('en-US');
-  $('tradeWins').textContent=String(wins);$('tradeLosses').textContent=String(losses);
-  $('tradeWinRate').textContent=settled?`${(Number(performance.win_rate)*100).toFixed(1)}%`:'—';
-  $('tradeProfit').textContent=profit==null?'—':money(profit);
-  $('tradeProfit').className=`value ${profit==null?'':Number(profit)>=0?'good-text':'bad-text'}`;
+  const rows=decision?.signals||[];
+  $('digitRows').innerHTML=rows.length?rows.map(row=>
+    `<tr><td>${safe(row.strategy_id)}</td><td class="num">${safe(row.predicted_digit)}</td><td class="num">${pct(row.predicted_digit_probability)}</td><td>${safe(decision.signal_current?'RESEARCH ONLY':decision.market_fresh?'ANALYSIS PENDING':'STALE · NOT CURRENT')}</td><td class="decision-no">NO TRADE</td></tr>`
+  ).join(''):'<tr><td colspan="5" class="muted">No strategy forecasts are available.</td></tr>';
 }
 function renderUnavailable(error){
   const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
+  const pipelineStatus=$('pipelineStatus');pipelineStatus.className='status bad';pipelineStatus.querySelector('span').textContent='ERROR';
+  for(const id of ['subscriptionStatus','analysisStatus','strategyStatus','generationStatus','primaryAnalysisStatus','tickCounts','signalsRecorded','missingTicks','badTicks'])$(id).textContent='—';
+  $('pipelineError').textContent=`API unavailable: ${error.message}`;$('pipelineError').hidden=false;
+  $('signalHistory').innerHTML=`<tr><td colspan="5" class="error">Signal history unavailable: ${safe(error.message)}</td></tr>`;
   $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
-  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
-  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
-  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval','tradeTotal','tradeWins','tradeLosses','tradeWinRate','tradeProfit'])$(id).textContent='—';
-  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>`<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">API unavailable: ${safe(error.message)}</td></tr>`).join('');
+  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='API ERROR';
+  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO LIVE FORECAST';
+  $('primaryReason').textContent=`Primary signal unavailable: ${error.message}`;
+  $('historyUpdated').textContent='History unavailable';
+  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
+  $('digitRows').innerHTML=`<tr><td colspan="5" class="error">API unavailable: ${safe(error.message)}</td></tr>`;
 }
-async function refresh(){
+let refreshing=false;
+async function refresh(forceHistory=false){
+  if(refreshing)return;
+  refreshing=true;
   try{
-    const decision=await api(`/decision?symbol=${encodeURIComponent(state.symbol)}`);
-    renderMarket(decision);
-    renderSignal(decision);
-    renderDigits(decision);
-    renderVolatility(decision);
-    renderPaper(decision.performance);
-    $('updatedAt').textContent=`Updated ${new Date(decision.created_at).toLocaleTimeString()}`;
+    const symbol=encodeURIComponent(state.symbol);
+    const cachedHistory=historyCache.get(state.symbol);
+    const shouldFetchHistory=forceHistory||!cachedHistory||Date.now()-cachedHistory.fetchedAt>=HISTORY_REFRESH_MS;
+    const historyRequest=shouldFetchHistory
+      ?api(`/signals/history?symbol=${encodeURIComponent(state.symbol)}&limit=100`)
+      :Promise.resolve(cachedHistory.data);
+    const [health,ticks,signals,primary,history]=await Promise.all([
+      api('/health'),
+      api(`/ticks/latest?symbol=${symbol}&limit=1`),
+      api(`/signals?symbol=${symbol}`),
+      api(`/signals/primary?symbol=${symbol}`),
+      historyRequest
+    ]);
+    if(shouldFetchHistory)historyCache.set(state.symbol,{data:history,fetchedAt:Date.now()});
+    const pipeline=health.pipeline?.[state.symbol]||{};
+    const tick=ticks[0]||null;
+    const marketFresh=pipeline.data_status==='RECEIVING DATA'&&tick!==null;
+    const signalCurrent=marketFresh&&tick!==null
+      &&Number(signals.observed_epoch)===Number(tick.epoch)
+      &&Number(signals.observed_tick_id)===Number(tick.id)
+      &&(signals.status===undefined||signals.signals?.length>0);
+    const snapshot={
+      symbol:state.symbol,
+      primary_analysis:health.primary_analysis?.[state.symbol]||{},
+      market_status:{
+        connection_status:pipeline.connection_status,
+        data_status:pipeline.data_status,
+        freshness_seconds:pipeline.freshness_seconds,
+        latest_tick:tick,
+      },
+      pipeline,
+      signals:signals.signals||[],
+      signals_status:signals.status,
+      primary_signal:primary,
+      market_fresh:marketFresh,
+      signal_current:signalCurrent,
+    };
+    renderMarket(snapshot);
+    renderSignalHistory(history,historyCache.get(state.symbol)?.fetchedAt);
+    renderSignal(snapshot.primary_signal,snapshot.primary_analysis);
+    renderDigits(snapshot);
+    $('updatedAt').textContent=`Updated ${new Date().toLocaleTimeString()}`;
   }catch(error){
     renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
+  }finally{
+    refreshing=false;
   }
 }
-$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh()});
+$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh(true)});
 refresh();setInterval(refresh,3000);
 </script>
 </body>

@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS audit_events(
 );
 CREATE INDEX IF NOT EXISTS ix_events_symbol_strategy ON audit_events(symbol,strategy_id,seq);
 CREATE INDEX IF NOT EXISTS ix_events_type_note ON audit_events(event_type,note);
+CREATE INDEX IF NOT EXISTS ix_events_symbol_type_seq ON audit_events(symbol,event_type,seq);
+CREATE INDEX IF NOT EXISTS ix_events_symbol_type_epoch_seq ON audit_events(symbol,event_type,forecast_epoch,seq);
 CREATE TABLE IF NOT EXISTS duration_events(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
  event_type TEXT NOT NULL CHECK(event_type IN ('QUOTE','SETTLE')),
@@ -86,7 +88,7 @@ class Store:
             return cur.lastrowid
     def history(self, symbol, limit=1000):
         with self.connect() as c:
-            rows = c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY id DESC LIMIT ?",(symbol,limit)).fetchall()
+            rows = c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY epoch DESC,id DESC LIMIT ?",(symbol,limit)).fetchall()
         return list(reversed(rows))
     def digit_counts(self, symbol):
         with self.connect() as c:
@@ -100,6 +102,19 @@ class Store:
             cur = c.execute("""INSERT INTO audit_events(event_id,event_type,created_utc,symbol,strategy_id,strategy_version,parameters_json,forecast_tick_id,forecast_epoch,prediction,probabilities_json,payout,stake,proposal_id,note)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(str(uuid.uuid4()),"FORECAST",utc_now(),symbol,forecast.strategy_id,forecast.version,json.dumps(forecast.parameters,sort_keys=True),tick_id,epoch,forecast.prediction,json.dumps(forecast.probabilities),str(payout) if payout is not None else None,str(stake) if stake is not None else None,proposal_id,note))
             return cur.lastrowid
+    def append_forecasts(self, symbol, forecasts, tick_id, epoch, payout=None, stake=None, proposal_id=None, note=None):
+        import uuid
+        seqs=[]
+        with self.connect() as c:
+            for forecast in forecasts:
+                cur=c.execute("""INSERT INTO audit_events(event_id,event_type,created_utc,symbol,strategy_id,strategy_version,parameters_json,forecast_tick_id,forecast_epoch,prediction,probabilities_json,payout,stake,proposal_id,note)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()),"FORECAST",utc_now(),symbol,forecast.strategy_id,forecast.version,
+                     json.dumps(forecast.parameters,sort_keys=True),tick_id,epoch,forecast.prediction,
+                     json.dumps(forecast.probabilities),str(payout) if payout is not None else None,
+                     str(stake) if stake is not None else None,proposal_id,note))
+                seqs.append(cur.lastrowid)
+        return seqs
     def score_open_forecasts(self, symbol, actual_tick_id, actual_epoch, actual_digit):
         import uuid
         with self.connect() as c:
@@ -134,7 +149,7 @@ class Store:
 
     def is_latest_tick(self, symbol, tick_id):
         with self.connect() as c:
-            row=c.execute("SELECT id FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT 1",(symbol,)).fetchone()
+            row=c.execute("SELECT id FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT 1",(symbol,)).fetchone()
         return bool(row and row[0]==tick_id)
 
     def forecasts(self, symbol=None, limit=None):
@@ -170,6 +185,25 @@ class Store:
             if limit is not None:
                 result.reverse()
             return result
+
+    def recent_forecasts(self, symbol, limit=50):
+        with self.connect() as c:
+            rows=c.execute("""SELECT f.seq,f.strategy_id,f.strategy_version,f.parameters_json,
+                f.forecast_tick_id,f.forecast_epoch,f.prediction,f.probabilities_json,
+                f.created_utc,s.actual_digit,s.hit,s.actual_tick_id
+                FROM audit_events f
+                LEFT JOIN audit_events s ON s.event_type='SCORE' AND s.note=CAST(f.seq AS TEXT)
+                WHERE f.event_type='FORECAST' AND f.symbol=?
+                ORDER BY f.forecast_epoch DESC,f.seq DESC LIMIT ?""",
+                (symbol,max(1,int(limit)))).fetchall()
+        result=[]
+        for row in reversed(rows):
+            item=dict(row)
+            item["probabilities"]=json.loads(item.pop("probabilities_json")) if item.get("probabilities_json") else None
+            item["version"]=item.pop("strategy_version")
+            item["parameters"]=json.loads(item.pop("parameters_json")) if item.get("parameters_json") else {}
+            result.append(item)
+        return result
 
     def append_duration_quote(self, symbol, forecast, forecast_seq, tick_id, epoch, duration, stake, payout, proposal_id, spot_time):
         import uuid
@@ -243,7 +277,7 @@ class Store:
     def quality_history(self, symbol, limit=20):
         with self.connect() as c:
             rows=c.execute(
-                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",
+                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT ?",
                 (symbol,max(1,int(limit))),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
@@ -283,5 +317,5 @@ class Store:
     def ticks_frame(self, symbol):
         import pandas as pd
         with self.connect() as c:
-            rows=c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY id",(symbol,)).fetchall()
+            rows=c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY epoch,id",(symbol,)).fetchall()
         return pd.DataFrame([dict(r) for r in rows])

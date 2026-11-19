@@ -10,7 +10,7 @@ BROMAX is one connected application, not two independent predictors. The Deriv c
 
 **No live trading:** this build intentionally contains no API token login, no account authorization, and no `buy`/`sell` request. It is fully runnable in live-feed + read-only-quote + paper-execution mode. Because no strategy has been validated and explicitly approved by default, a fresh installation starts in observation/research mode and does not fabricate trades.
 
-The minimal dashboard and Windows floating panel both consume `GET /decision?symbol=...`. This single deterministic snapshot runs eight specialist roles (including the coordinator), checks that the market tick did not change during evaluation, and exposes a paper signal only when the existing research, probability, quote, volatility, approval, and risk gates all pass. Agent summaries are stored append-only and repeated identical decisions are throttled; an LLM is not needed to calculate probabilities or authorize trades.
+The compact browser dashboard uses lightweight `/health`, `/signals`, `/signals/primary`, and `/signals/history` endpoints so live forecasts remain visible without waiting for full research reports. A single background worker checks fresh ticks once per second, runs inexpensive preflight gates first, and starts full eight-agent qualification only when those gates pass; full analysis is limited to once per symbol per minute and never overlaps another decision run. The primary panel only displays a cached qualification that matches the latest fresh tick; otherwise it explicitly shows `NO QUALIFIED SIGNAL`. Strategy forecasts and probabilities remain research-only and never authorize trades.
 
 ## 2. What was inspected and changed
 
@@ -21,7 +21,7 @@ The available earlier project was `deriv_matches_starter.zip`, containing `app/m
 1. **Precision was only provisional.** The starter `quote_details()` inferred decimal places from the serialized quote string and did not read `tick.pip_size`. It did preserve `Decimal` and did not explicitly strip zeroes, but it could not restore zeroes absent from the JSON number. BROMAX formats each quote to Deriv's `pip_size` precision before extracting the last displayed decimal digit. It never routes quotes through binary floats.
 2. **Database lifecycle.** The starter ran `CREATE TABLE IF NOT EXISTS` on each connection, and its `with sqlite3.connect(...)` usage committed transactions but did not explicitly close the connection. BROMAX initializes the schema once, uses WAL/indexes, and closes each connection through a dedicated context wrapper.
 3. **Single-symbol state.** The starter used one global symbol and an index only on epoch. BROMAX accepts multiple symbols and every history/forecast query is symbol-scoped.
-4. **No deduplication or audit immutability.** The starter had no unique tick key and no append-only triggers. BROMAX deduplicates 1-second ticks by `(symbol, epoch)` (not `tick.id`, which Deriv defines as a per-connection unsubscribe identifier) and prevents updates/deletes to tick, event and frozen-snapshot records.
+4. **No deduplication or audit immutability.** The starter had no unique tick key and no append-only triggers. BROMAX deduplicates 1-second ticks by `(symbol, epoch)` (not `tick.id`, which Deriv defines as a per-connection unsubscribe identifier), rejects out-of-order live ticks, records epoch gaps, and prevents updates/deletes to tick, event and frozen-snapshot records.
 5. **No forecasts or outcome linkage.** BROMAX creates an immutable forecast event before the next tick is processed, then appends a separate score event against the immediately following one-second epoch only. If a tick is missed, the forecast is left unscored; it is never scored against a later tick.
 6. **No strategy versioning.** Every forecast records strategy ID, semantic version, exact parameter JSON, prediction, full 10-digit probability vector, forecast tick ID and timestamp.
 7. **No payout accounting.** BROMAX requests a `DIGITMATCH` proposal for the predicted digit, stake, currency and one-tick duration. The proposal is recorded as a separate append-only quote event, including Deriv’s `spot_time` for audit. Missing quotes are never replaced with assumed payouts; those forecasts cannot contribute to EV or open a paper position.
@@ -130,14 +130,17 @@ uvicorn app:app --host 127.0.0.1 --port 8765
 
 The dashboard opens at `http://127.0.0.1:8765/dashboard`; the API docs are at `http://127.0.0.1:8765/docs`. You can also generate a report from the command line with `python -m bromax.cli report`. The CLI default writes the approval report to `reports/bromax_report.json`; the paper bot reads that fixed path.
 
-- `GET /dashboard` — minimal five-section trading decision terminal.
+- `GET /dashboard` — compact live-market terminal with the cached qualified primary signal (or a clear no-signal state), per-strategy forecasts, pipeline status, and persisted forecast history.
 - `GET /advanced` — detailed research, strategy, timing, and historical dashboard.
-- `GET /decision?symbol=1HZ100V` — one timestamped response for the dashboard and floating panel, including all ten digit decisions, market freshness, volatility, recorded paper results, and the eight deterministic agent results. It fails closed if the latest tick changes during evaluation.
-- `GET /health` — collector state, per-symbol tick count, last quote, stale-data status and recent errors.
+- `GET /decision?symbol=1HZ100V` — one timestamped response including the eight deterministic agent results. It fails closed if the latest tick changes during evaluation and returns HTTP 503 rather than overlapping the bounded background analysis.
+- `POST /safety/kill-switch` — one-way, process-wide execution stop. It starts engaged, can only be engaged (never cleared through the API), and does not add live execution.
+- `GET /health` — WebSocket and subscription state, per-symbol tick/forecast counts, last quote, data freshness, analysis/strategy/signal-generation state, background primary-analysis status, quality counters, and recent errors.
+- `GET /performance` — rolling 256-tick monotonic timing summaries for JSON parsing, data processing, strategy evaluation, forecast persistence, and receive-to-forecast latency. Network transit is excluded.
 - `GET /ticks/latest?symbol=1HZ100V` — latest raw/displayed quotes and digits.
 - `GET /digits/distribution?symbol=1HZ100V&window=1000` — rolling empirical digit frequencies.
 - `GET /intelligence?symbol=1HZ100V&window=1000` — conditional order 1/2/3 recurrence, transition matrix, digit-run length, uniformity diagnostic and descriptive price-volatility metrics.
-- `GET /signals?symbol=1HZ100V` — current candidate forecasts and probability vectors, always marked research-only and never an approval to trade.
+- `GET /signals?symbol=1HZ100V` — the collector's persisted forecasts for the latest fully analyzed tick. It never recalculates a second, potentially divergent signal set; returns `analysis_pending` rather than stale/incomplete forecasts. Outputs remain research-only.
+- `GET /signals/history?symbol=1HZ100V&limit=50` — persisted strategy forecasts with prediction probability, target epoch, scored hit/miss, and current/expired status. This read-only analysis history never places an order.
 - `GET /forecasts?symbol=1HZ100V&limit=500` — most recent forecasts, scores and quote metadata (limit 1–5,000).
 - `GET /report` — statistical report.
 - `GET /paper/status` — paper limits and execution state.
@@ -145,7 +148,7 @@ The dashboard opens at `http://127.0.0.1:8765/dashboard`; the API docs are at `h
 
 There is no live-execution route and no buy/sell endpoint.
 
-The collector stores data in `data/bromax.sqlite3`. Research final-test snapshots are stored write-once in the same database; new ticks after the frozen snapshot belong to the forward paper period, not a refreshed final test. Keep the process running to collect a meaningful sample. A live quote proposal is requested asynchronously for each distinct predicted digit (maximum three concurrent proposal connections and 20 pending quote tasks; if the queue fills, forecasts are retained but payout requests are skipped). The proposal `spot_time` must equal the forecast tick epoch, and the quote must be recorded before the next tick; otherwise no paper position is opened and the payout is excluded. The forecast remains in the log with missing payout and is excluded from payout-adjusted EV.
+The collector stores data in `data/bromax.sqlite3`. Research final-test snapshots are stored write-once in the same database; new ticks after the frozen snapshot belong to the forward paper period, not a refreshed final test. Keep the process running to collect a meaningful sample. A live quote proposal is requested asynchronously for each distinct predicted digit (maximum three concurrent proposal connections and 20 pending quote tasks; if the queue fills, forecasts are retained but payout requests are skipped). Quote, paper-gate, and duration-ledger writes run in a serialized worker thread so optional quote processing does not block the collector's WebSocket event loop. The proposal `spot_time` must equal the forecast tick epoch, and the quote must be recorded before the next tick; otherwise no paper position is opened and the payout is excluded. The forecast remains in the log with missing payout and is excluded from payout-adjusted EV.
 
 ## 8. Research protocol and report interpretation
 
@@ -284,7 +287,7 @@ The local API/dashboard server now listens on port **8765** instead of 8000. Ope
 
 ## Digit evidence dashboard and floating panel
 
-`/dashboard` is the compact decision terminal: market status, a ten-digit probability/health/decision table, the best qualified paper signal, volatility-filter status, and recorded paper results. Probabilities remain blank when the model has no estimate. The 0–100 evidence-health score is not a win probability, and no digit is marked `TRADE · PAPER ONLY` unless per-digit research evidence and every current quote, timing, manual-approval, and paper-risk gate pass. The former detailed dashboard remains available at `/advanced`; `/digits/analysis?symbol=1HZ100V` supplies its full research data to clients.
+`/dashboard` is the compact live terminal: market status, current predictions from the existing strategies, pipeline status, and persisted signal history. Model probabilities are displayed as research-only estimates, not calibrated win chances or trade recommendations. The full qualification and digit-evidence analyses remain available through `/advanced` and `/digits/analysis?symbol=1HZ100V`; neither is required for continuous tick collection or strategy forecast generation.
 
 On Windows, `INSTALL_AND_RUN.bat` opens both the browser dashboard and a synchronized floating panel. The panel shows only the recommended digit, probability, health, duration, volatility approval, and paper trade status; it can stay on top of other windows, resize, and open the dashboard. To run it separately while the API is already running:
 

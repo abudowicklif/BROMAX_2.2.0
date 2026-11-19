@@ -15,9 +15,27 @@ import time
 from typing import Any, Callable, Literal
 
 from .digits import extract_last_digit
+from .strategies import candidate_strategies
 
 AgentStatus = Literal["APPROVED", "REJECTED", "INSUFFICIENT_EVIDENCE", "MONITORING", "ERROR"]
 log = logging.getLogger("bromax.agents")
+
+AGENT_ROLES = {
+    "data_intelligence": "live data quality gate",
+    "strategy_research": "strategy validation gate",
+    "probability_calibration": "forecast integrity and disagreement check",
+    "market_regime": "current volatility regime gate",
+    "contract_intelligence": "paper contract quote and expected-value check",
+    "risk_signal_approval": "paper-only risk veto",
+    "performance_learning": "historical outcome monitoring",
+    "chief_intelligence_coordinator": "paper decision consolidation",
+}
+RESEARCH_SELECTION_GATES = (
+    "data_intelligence",
+    "strategy_research",
+    "probability_calibration",
+    "market_regime",
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +76,242 @@ def _run(agent_id: str, evaluate: Callable[[], AgentResult]) -> AgentResult:
     result = replace(result, duration_ms=round((time.perf_counter() - started) * 1000, 3))
     log.info("Agent %s status=%s duration_ms=%.3f", agent_id, result.status, result.duration_ms)
     return result
+
+
+def _strategy_batch_summary(signal_data: dict[str, Any]) -> dict[str, Any]:
+    expected_ids = {strategy.strategy_id for strategy in candidate_strategies()}
+    rows = signal_data.get("signals") or []
+    strategy_ids = [
+        str(row.get("strategy_id"))
+        for row in rows
+        if isinstance(row, dict) and row.get("strategy_id")
+    ]
+    received_ids = set(strategy_ids)
+    duplicates = sorted({strategy_id for strategy_id in strategy_ids if strategy_ids.count(strategy_id) > 1})
+    try:
+        tick_id = int(signal_data["observed_tick_id"])
+        epoch = int(signal_data["observed_epoch"])
+    except (KeyError, TypeError, ValueError):
+        tick_id = epoch = None
+    valid = (
+        signal_data.get("status") not in {"analysis_pending", "insufficient_history"}
+        and bool(signal_data.get("symbol"))
+        and tick_id is not None
+        and epoch is not None
+        and len(strategy_ids) == len(rows) == len(expected_ids)
+        and received_ids == expected_ids
+        and not duplicates
+    )
+    return {
+        "status": "COMPLETE" if valid else "INCOMPLETE",
+        "symbol": signal_data.get("symbol"),
+        "observed_tick_id": tick_id,
+        "observed_epoch": epoch,
+        "expected_count": len(expected_ids),
+        "received_count": len(rows),
+        "missing_strategy_ids": sorted(expected_ids - received_ids),
+        "unexpected_strategy_ids": sorted(received_ids - expected_ids),
+        "duplicate_strategy_ids": duplicates,
+        "invalid_rows": len(rows) - len(strategy_ids),
+    }
+
+
+def _coordination_summary(
+    signal_data: dict[str, Any],
+    results: list[AgentResult],
+    consistent: bool,
+) -> dict[str, Any]:
+    strategy_batch = _strategy_batch_summary(signal_data)
+    by_id = {result.agent_id: result for result in results}
+    missing_agents = [agent_id for agent_id in RESEARCH_SELECTION_GATES if agent_id not in by_id]
+    gate_statuses = {
+        agent_id: by_id[agent_id].status
+        for agent_id in RESEARCH_SELECTION_GATES
+        if agent_id in by_id
+    }
+
+    if not consistent:
+        status = "INCONSISTENT_SNAPSHOT"
+    elif strategy_batch["status"] != "COMPLETE":
+        status = "INCOMPLETE_STRATEGY_BATCH"
+    elif missing_agents:
+        status = "MISSING_REQUIRED_AGENT"
+    elif any(value == "ERROR" for value in gate_statuses.values()):
+        status = "AGENT_ERROR"
+    elif any(value == "REJECTED" for value in gate_statuses.values()):
+        status = "REJECTED"
+    elif any(value != "APPROVED" for value in gate_statuses.values()):
+        status = "INSUFFICIENT_EVIDENCE"
+    else:
+        status = "READY_FOR_SELECTION"
+
+    contributions = []
+    for result in results:
+        contribution_status = {
+            "APPROVED": "ACCEPTED",
+            "REJECTED": "REJECTED",
+            "INSUFFICIENT_EVIDENCE": "UNAVAILABLE",
+            "MONITORING": "MONITORING",
+            "ERROR": "ERROR",
+        }[result.status]
+        contributions.append({
+            "agent_id": result.agent_id,
+            "role": AGENT_ROLES.get(result.agent_id, "unregistered agent"),
+            "status": result.status,
+            "contribution_status": contribution_status,
+            "summary": result.summary,
+            "duration_ms": result.duration_ms,
+            "reasons": list(result.reasons),
+        })
+
+    return {
+        "status": status,
+        "selection_ready": status == "READY_FOR_SELECTION",
+        "snapshot_consistent": consistent,
+        "snapshot_tick_id": strategy_batch["observed_tick_id"],
+        "snapshot_epoch": strategy_batch["observed_epoch"],
+        "strategy_batch": strategy_batch,
+        "required_research_gates": gate_statuses,
+        "missing_required_agents": missing_agents,
+        "agent_contributions": contributions,
+        "paper_signal_status": by_id.get("risk_signal_approval").status
+        if by_id.get("risk_signal_approval") else "UNAVAILABLE",
+        "selection": "DEFERRED_TO_QUALIFICATION_STAGE",
+    }
+
+
+def select_primary_signal(
+    signal_data: dict[str, Any],
+    agent_results: list[dict[str, Any]],
+    coordination: dict[str, Any],
+    evaluated_at: str | None = None,
+) -> dict[str, Any]:
+    symbol = signal_data.get("symbol")
+    tick_id = coordination.get("snapshot_tick_id")
+    epoch = coordination.get("snapshot_epoch")
+    reasons = []
+    by_id = {result.get("agent_id"): result for result in agent_results}
+
+    strategy_batch = coordination.get("strategy_batch")
+    if strategy_batch is None:
+        strategy_batch = _strategy_batch_summary(signal_data)
+    if strategy_batch.get("status") != "COMPLETE":
+        reasons.append("The current tick does not have a complete registered strategy batch.")
+    if (
+        tick_id != signal_data.get("observed_tick_id")
+        or epoch != signal_data.get("observed_epoch")
+    ):
+        reasons.append("The strategy batch does not match the coordinated tick.")
+    if not coordination.get("selection_ready"):
+        reasons.append(f"Required analysis is not ready ({coordination.get('status', 'UNKNOWN')}).")
+        for agent_id in RESEARCH_SELECTION_GATES:
+            result = by_id.get(agent_id)
+            if result is None:
+                reasons.append(f"Required analysis is unavailable: {agent_id}.")
+            elif result.get("status") != "APPROVED":
+                detail = result.get("summary") or result.get("status") or "not approved"
+                reasons.append(f"{agent_id}: {detail}")
+
+    strategy_result = by_id.get("strategy_research") or {}
+    strategy_id = (strategy_result.get("metrics") or {}).get("selected_strategy_id")
+    strategy_rows = [
+        row for row in (signal_data.get("signals") or [])
+        if isinstance(row, dict)
+    ]
+    selected_row = next(
+        (row for row in strategy_rows if row.get("strategy_id") == strategy_id),
+        None,
+    ) if strategy_id else None
+    probability_result = by_id.get("probability_calibration") or {}
+    candidate_digits = (probability_result.get("output") or {}).get("candidate_digits") or []
+
+    if not strategy_id:
+        reasons.append("Research validation did not identify a selected strategy.")
+    if selected_row is None:
+        reasons.append("The research-selected strategy has no forecast for the current tick.")
+    if selected_row is not None:
+        try:
+            digit = int(selected_row["predicted_digit"])
+            probabilities = [float(value) for value in selected_row["probabilities"]]
+            model_probability = probabilities[digit] if digit in range(10) and len(probabilities) == 10 else None
+            published_probability = float(selected_row["predicted_digit_probability"])
+        except (KeyError, TypeError, ValueError, IndexError):
+            digit = None
+            probabilities = []
+            model_probability = None
+            published_probability = None
+            reasons.append("The selected strategy forecast is incomplete.")
+        if digit not in range(10):
+            reasons.append("The selected strategy forecast contains an invalid digit.")
+        if (
+            len(probabilities) != 10
+            or any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities)
+            or not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-6)
+        ):
+            reasons.append("The selected strategy probability vector is invalid.")
+        if (
+            model_probability is not None
+            and published_probability is not None
+            and not math.isclose(model_probability, published_probability, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            reasons.append("The selected strategy's displayed probability does not match its vector.")
+        if digit not in candidate_digits:
+            reasons.append("The selected digit is not present in the validated strategy outputs.")
+
+    if reasons:
+        return {
+            "status": "NO QUALIFIED SIGNAL",
+            "qualification_status": "BLOCKED",
+            "symbol": symbol,
+            "digit": None,
+            "strategy_id": None,
+            "observed_tick_id": tick_id,
+            "observed_epoch": epoch,
+            "target_epoch": int(epoch) + 1 if epoch is not None else None,
+            "timestamp": evaluated_at or datetime.now(timezone.utc).isoformat(),
+            "model_probability": None,
+            "probability_is_calibrated": False,
+            "strategy_agreement": None,
+            "reasons": list(dict.fromkeys(reasons)),
+            "trade_authorized": False,
+        }
+
+    agreement_count = sum(
+        int(row.get("predicted_digit", -1)) == digit
+        for row in strategy_rows
+    )
+    research_metrics = strategy_result.get("metrics") or {}
+    regime_metrics = (by_id.get("market_regime") or {}).get("metrics") or {}
+    data_metrics = (by_id.get("data_intelligence") or {}).get("metrics") or {}
+    calibration_metrics = probability_result.get("metrics") or {}
+    return {
+        "status": "QUALIFIED",
+        "qualification_status": "QUALIFIED_RESEARCH_SIGNAL",
+        "symbol": symbol,
+        "digit": digit,
+        "strategy_id": strategy_id,
+        "observed_tick_id": tick_id,
+        "observed_epoch": epoch,
+        "target_epoch": int(epoch) + 1 if epoch is not None else None,
+        "timestamp": evaluated_at or datetime.now(timezone.utc).isoformat(),
+        "model_probability": model_probability,
+        "probability_is_calibrated": False,
+        "evidence": {
+            "validation_finalist": research_metrics.get("validation_finalist"),
+            "final_test_verdict": research_metrics.get("final_test_verdict"),
+            "final_test_n": research_metrics.get("final_test_n"),
+            "market_regime": regime_metrics.get("current_regime"),
+            "data_quality_score": data_metrics.get("quality_score"),
+            "mean_validation_calibration_error": calibration_metrics.get("mean_validation_calibration_error"),
+        },
+        "strategy_agreement": {
+            "agreeing_strategies": agreement_count,
+            "total_strategies": len(strategy_rows),
+            "used_as_weight": False,
+        },
+        "reasons": [],
+        "trade_authorized": False,
+    }
 
 
 class DataIntelligenceAgent:
@@ -204,6 +458,7 @@ class ProbabilityCalibrationAgent:
                 )
             reasons = []
             estimates = 0
+            estimated_probabilities = []
             health_scores = []
             calibration_errors = []
             for row in rows:
@@ -214,6 +469,7 @@ class ProbabilityCalibrationAgent:
                         reasons.append(f"Digit {row['digit']} has an invalid probability.")
                     else:
                         estimates += 1
+                        estimated_probabilities.append(probability)
                 health = row.get("health_percent")
                 if health is not None:
                     health = float(health)
@@ -223,9 +479,25 @@ class ProbabilityCalibrationAgent:
                         health_scores.append(health)
                 calibration = (row.get("validation") or {}).get("absolute_calibration_error")
                 if calibration is not None:
-                    calibration_errors.append(float(calibration))
+                    calibration = float(calibration)
+                    if not math.isfinite(calibration) or not 0 <= calibration <= 1:
+                        reasons.append(f"Digit {row['digit']} has an invalid calibration error.")
+                    else:
+                        calibration_errors.append(calibration)
             vectors = signals.get("signals") or []
             disagreement = set()
+            if vectors:
+                strategy_ids = [str(signal.get("strategy_id") or "") for signal in vectors]
+                expected_strategy_ids = {
+                    strategy.strategy_id for strategy in candidate_strategies()
+                }
+                if (
+                    len(strategy_ids) != len(set(strategy_ids))
+                    or set(strategy_ids) != expected_strategy_ids
+                ):
+                    reasons.append(
+                        "Current forecasts must contain exactly one output from every registered strategy."
+                    )
             for signal in vectors:
                 probabilities = [float(value) for value in signal.get("probabilities") or []]
                 if len(probabilities) != 10 or any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities):
@@ -249,6 +521,12 @@ class ProbabilityCalibrationAgent:
                     self.agent_id, "INSUFFICIENT_EVIDENCE", "A current probability estimate is unavailable for every digit.",
                     ("Probability output remains blank where the selected model has no valid estimate.",),
                     {"digit_rows": len(rows), "valid_digit_estimates": estimates, "candidate_vectors": len(vectors)},
+                )
+            if not math.isclose(sum(estimated_probabilities), 1.0, rel_tol=0.0, abs_tol=1e-6):
+                return _result(
+                    self.agent_id, "REJECTED", "Per-digit model probabilities do not form a distribution.",
+                    ("The ten estimated digit probabilities must sum to one.",),
+                    {"digit_rows": len(rows), "valid_digit_estimates": estimates},
                 )
             return _result(
                 self.agent_id, "APPROVED", "Ten finite digit probabilities and candidate vectors passed integrity checks.",
@@ -569,8 +847,15 @@ def coordinate_snapshot(
     results=[replace(result,evaluated_at=timestamp) for result in results]
     coordinator_result=results[-1]
     decision=coordinator_result.output
+    coordination=_coordination_summary(signal_data,results,consistent)
+    primary_signal=select_primary_signal(
+        signal_data, [result.as_dict() for result in results], coordination, timestamp
+    )
+    coordination["selection"]=primary_signal["status"]
     return {
         "decision":decision,
         "agents":[result.as_dict() for result in results],
         "performance":performance_result.metrics,
+        "coordination":coordination,
+        "primary_signal":primary_signal,
     }

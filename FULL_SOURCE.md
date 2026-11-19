@@ -1,8 +1,69 @@
-# BROMAX 2.2.0 ? Complete Source Listing
+# BROMAX 2.2.0 - Complete Source Listing
 
 Generated from the packaged BROMAX source tree. Local credentials, databases, reports, and virtual environments are excluded.
 
 ---
+
+## `.dockerignore`
+
+```text
+.venv
+__pycache__
+.pytest_cache
+*.py[cod]
+*.egg-info
+.env
+.git
+data
+reports
+approved_strategies.json
+```
+
+## `.env.example`
+
+```text
+DERIV_SYMBOLS=1HZ100V
+DERIV_WS_URL=wss://api.derivws.com/trading/v1/options/ws/public
+DATABASE_PATH=data/bromax.sqlite3
+CURRENCY=USD
+PAPER_STAKE=1.00
+MAX_PAPER_STAKE=1.00
+DAILY_LOSS_CAP=10.00
+MAX_TRADES_PER_DAY=100
+MAX_DATA_AGE_SECONDS=5
+MIN_HISTORY_TICKS=1000
+PROPOSAL_TIMEOUT_SECONDS=4
+MAX_PENDING_QUOTE_TASKS=20
+```
+
+## `.gitignore`
+
+```text
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+reports/*.json
+approved_strategies.json
+*.egg-info/
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
+```
+
+## `app.py`
+
+```python
+"""ASGI entry point: run with `uvicorn app:app`."""
+from bromax.api import app
+
+__all__ = ["app"]
+```
 
 ## `bromax/__init__.py`
 
@@ -10,8 +71,6 @@ Generated from the packaged BROMAX source tree. Local credentials, databases, re
 """BROMAX: auditable MATCH-only research and paper simulation."""
 __version__ = "1.0.0"
 ```
-
----
 
 ## `bromax/agents.py`
 
@@ -594,8 +653,6 @@ def coordinate_snapshot(
     }
 ```
 
----
-
 ## `bromax/api.py`
 
 ```python
@@ -606,10 +663,11 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pathlib import Path
 import json
 from threading import Lock
+from decimal import Decimal, InvalidOperation
 from .config import Settings
 from .storage import Store
 from .collector import MarketCollector
-from .paperbot import PaperBot
+from .paperbot import ExecutionInterface, PaperBot
 from .agents import coordinate_snapshot
 from .reporting import write_report
 from .intelligence import analyze_ticks
@@ -620,6 +678,7 @@ from uuid import uuid4
 logging.basicConfig(level=logging.INFO)
 settings=Settings.from_env(); store=Store(settings.database_path)
 paperbot=PaperBot(store,settings.paper_stake,settings.max_paper_stake,settings.daily_loss_cap,settings.max_trades_per_day)
+execution_interface=ExecutionInterface()
 collector=MarketCollector(settings,store,paperbot)
 collector_task=None
 _report_cache={"created":0.0,"value":None}
@@ -680,16 +739,39 @@ def health():
         counts={s:c.execute("SELECT COUNT(*) FROM ticks WHERE symbol=?",(s,)).fetchone()[0] for s in settings.symbols}
         latest={}
         for s in settings.symbols:
-            r=c.execute("SELECT epoch,quote_text,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT 1",(s,)).fetchone()
+            r=c.execute("SELECT epoch,quote_text,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT 1",(s,)).fetchone()
             latest[s]=dict(r) if r else None
     stale={s:(collector.last_received.get(s) is None or time.time()-collector.last_received[s]>settings.max_data_age_seconds) for s in settings.symbols}
-    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"recent_errors":collector.errors[-10:]}
+    pipeline={s:_pipeline_state(s) for s in settings.symbols}
+    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"pipeline":pipeline,"recent_errors":collector.errors[-10:]}
+
+def _pipeline_state(symbol):
+    state=collector.operational_status(symbol)
+    state["recent_errors"]=collector.errors[-5:]
+    with store.connect() as c:
+        state["stored_ticks"]=c.execute("SELECT COUNT(*) FROM ticks WHERE symbol=?",(symbol,)).fetchone()[0]
+        state["stored_forecasts"]=c.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE symbol=? AND event_type='FORECAST'",(symbol,)
+        ).fetchone()[0]
+    return state
+
+@app.post("/safety/kill-switch")
+def engage_execution_kill_switch():
+    """Engage the one-way live-execution kill switch; never enables orders."""
+    execution_interface.engage_kill_switch()
+    logging.getLogger("bromax.safety").warning("Execution kill switch engaged")
+    return {
+        "status":"KILL_SWITCH_ENGAGED",
+        "kill_switch_engaged":execution_interface.kill_switch_engaged,
+        "live_execution_implemented":False,
+        "live_execution_enabled":False,
+    }
 
 @app.get("/ticks/latest")
 def latest_ticks(symbol: str, limit: int=50):
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
     with store.connect() as c:
-        rows=c.execute("SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",(symbol,max(1,min(limit,1000)))).fetchall()
+        rows=c.execute("SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT ?",(symbol,max(1,min(limit,1000)))).fetchall()
     return [dict(r) for r in rows]
 
 @app.get("/digits/distribution")
@@ -705,6 +787,48 @@ def forecasts(symbol: str, limit: int = 500):
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
     if limit < 1 or limit > 5000: raise HTTPException(422,"limit must be between 1 and 5000")
     return store.forecasts(symbol,limit=limit)
+
+@app.get("/signals/history")
+def signal_history(symbol: str, limit: int = 50):
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    if limit < 1 or limit > 500:
+        raise HTTPException(422,"limit must be between 1 and 500")
+    rows=store.forecasts(symbol,limit=limit)
+    latest=store.quality_history(symbol,1)
+    latest_epoch=int(latest[-1]["epoch"]) if latest else None
+    status=_pipeline_state(symbol)
+    now=time.time()
+    current_feed=(
+        collector.last_received.get(symbol) is not None
+        and now-collector.last_received[symbol]<=settings.max_data_age_seconds
+    )
+    signals=[]
+    for row in rows:
+        actual=row.get("actual_digit")
+        if actual is not None:
+            signal_status="SCORED_HIT" if row.get("hit") else "SCORED_MISS"
+        elif current_feed and int(row["forecast_epoch"])==latest_epoch:
+            signal_status="CURRENT"
+        else:
+            signal_status="EXPIRED_UNSCORED"
+        probabilities=row.get("probabilities") or []
+        prediction=int(row["prediction"])
+        confidence=probabilities[prediction] if prediction<len(probabilities) else None
+        signals.append({
+            "symbol":symbol,
+            "strategy_id":row["strategy_id"],
+            "prediction":prediction,
+            "confidence":confidence,
+            "forecast_epoch":int(row["forecast_epoch"]),
+            "target_epoch":int(row["forecast_epoch"])+1,
+            "created_at":row["created_utc"],
+            "status":signal_status,
+            "actual_digit":actual,
+            "hit":row.get("hit"),
+        })
+    return {"symbol":symbol,"pipeline":status,"signals":signals,"trade_authorized":False,
+            "note":"Persisted strategy forecasts are analysis records, not trade instructions. CURRENT applies only to the freshest tick while the live feed is fresh."}
 
 @app.get("/report")
 def report():
@@ -1200,6 +1324,7 @@ def unified_decision(symbol: str):
         })
     data_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="data_intelligence")
     regime_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="market_regime")
+    pipeline=_pipeline_state(symbol)
     return {
         "snapshot_id":snapshot_id,
         "created_at":snapshot_timestamp,
@@ -1214,11 +1339,17 @@ def unified_decision(symbol: str):
         "signal":approved_signal,
         "reasons":risk_result["reasons"],
         "market_status":{
-            "connected":not feed_stale,
+            "connected":pipeline["connection_status"]=="CONNECTED",
+            "connection_status":pipeline["connection_status"],
+            "subscription_status":pipeline["subscription_status"],
+            "data_status":pipeline["data_status"],
+            "pipeline_status":pipeline["pipeline_status"],
+            "receiving_data":pipeline["data_status"]=="RECEIVING DATA",
             "data_quality_status":data_agent["status"],
             "freshness_seconds":data_agent["metrics"].get("latest_tick_age_seconds"),
             "latest_tick":final_tick[-1] if final_tick else None,
         },
+        "pipeline":pipeline,
         "digits":digit_predictions,
         "volatility":{
             "condition":regime_agent["metrics"].get("current_regime"),
@@ -1268,8 +1399,6 @@ def advanced_dashboard():
             .replace("</header>",'<a href="/dashboard" style="color:#9ab9c8;margin-left:12px">Decision terminal</a></header>'))
 ```
 
----
-
 ## `bromax/cli.py`
 
 ```python
@@ -1287,13 +1416,13 @@ def main():
 if __name__=="__main__": main()
 ```
 
----
-
 ## `bromax/collector.py`
 
 ```python
 import asyncio, json, logging, time
+from datetime import datetime, timezone
 from decimal import Decimal
+from threading import Lock
 import websockets
 from .digits import extract_last_digit, quote_precision, QuotePrecisionError
 from .strategies import candidate_strategies, ForecastContext
@@ -1310,10 +1439,105 @@ class MarketCollector:
         self.quote_tasks=set()
         self.cumulative_counts={symbol:list(store.digit_counts(symbol)) for symbol in settings.symbols}
         self.strategies=candidate_strategies()
+        self._status_lock=Lock()
+        self.connection_status="DISCONNECTED"
+        self.connection_started_monotonic=None
+        self.reconnect_count=0
+        self.connection_error=None
+        self._symbol_status={
+            symbol:{
+                "subscription_status":"NOT_SUBSCRIBED",
+                "subscription_count":0,
+                "received_ticks":0,
+                "processed_ticks":0,
+                "duplicate_ticks":0,
+                "invalid_ticks":0,
+                "out_of_order_ticks":0,
+                "missing_tick_count":0,
+                "history_seeded_ticks":0,
+                "analysis_status":"WAITING_FOR_DATA",
+                "analysis_runs":0,
+                "strategy_status":"WAITING_FOR_DATA",
+                "strategy_runs":0,
+                "signal_generation_status":"WAITING_FOR_DATA",
+                "signals_generated":0,
+                "last_tick_epoch":None,
+                "last_tick_id":None,
+                "last_analysis_at":None,
+                "last_signal_at":None,
+                "last_signal_epoch":None,
+                "last_error":None,
+                "processing_errors":0,
+            }
+            for symbol in settings.symbols
+        }
 
-    def _record_error(self, message):
+    def _record_error(self, message, symbol=None):
         self.errors.append(str(message))
         if len(self.errors)>100: del self.errors[:-100]
+        with self._status_lock:
+            if symbol in self._symbol_status:
+                status=self._symbol_status[symbol]
+                status["last_error"]=str(message)
+                status["processing_errors"]+=1
+
+    def _update_symbol_status(self, symbol, **values):
+        with self._status_lock:
+            self._symbol_status[symbol].update(values)
+
+    def _increment_symbol_status(self, symbol, key, amount=1):
+        with self._status_lock:
+            status=self._symbol_status[symbol]
+            status[key]+=amount
+
+    def _set_connection_status(self, status, error=None, reconnect=False):
+        now=datetime.now(timezone.utc).isoformat()
+        with self._status_lock:
+            self.connection_status=status
+            self.connection_error=error
+            if reconnect:
+                self.reconnect_count+=1
+            for symbol_status in self._symbol_status.values():
+                symbol_status["connection_status"]=status
+                if status in {"CONNECTING","RECONNECTING","DISCONNECTED","ERROR"}:
+                    symbol_status["subscription_status"]="NOT_SUBSCRIBED"
+                if status=="CONNECTED":
+                    symbol_status["connected_at"]=now
+                    symbol_status["last_error"]=None
+                elif error:
+                    symbol_status["last_error"]=error
+
+    def operational_status(self, symbol):
+        if symbol not in self._symbol_status:
+            raise KeyError(symbol)
+        with self._status_lock:
+            result=dict(self._symbol_status[symbol])
+            result["connection_status"]=self.connection_status
+            result["reconnect_count"]=self.reconnect_count
+            result["connection_error"]=self.connection_error
+        received=self.last_received.get(symbol)
+        age=max(0.0,time.time()-received) if received is not None else None
+        result["freshness_seconds"]=round(age,3) if age is not None else None
+        result["data_status"]=(
+            "NO DATA" if age is None else
+            "STALE" if age>self.settings.max_data_age_seconds else
+            "RECEIVING DATA"
+        )
+        if result["connection_status"]=="RECONNECTING":
+            result["pipeline_status"]="RECONNECTING"
+        elif result.get("last_error"):
+            result["pipeline_status"]="ERROR"
+        elif result["data_status"]=="STALE":
+            result["pipeline_status"]="STALE DATA"
+        elif result["subscription_status"]!="SUBSCRIBED":
+            result["pipeline_status"]=result["connection_status"]
+        elif result["signal_generation_status"]=="GENERATING SIGNALS":
+            result["pipeline_status"]="GENERATING SIGNALS"
+        elif result["analysis_status"]=="ANALYZING":
+            result["pipeline_status"]="ANALYZING"
+        else:
+            result["pipeline_status"]="RECEIVING DATA"
+        return result
 
     def _seed_history(self, symbol, history, pip_size):
         """Persist a Deriv ticks_history response without generating retrospective forecasts."""
@@ -1323,30 +1547,71 @@ class MarketCollector:
         if len(prices)!=len(times):
             raise ValueError(f"Historical seed arrays have mismatched lengths for {symbol}")
         inserted=0
-        for price,epoch in zip(prices,times):
+        ordered=sorted(zip(times,prices),key=lambda item:int(item[0]))
+        for epoch,price in ordered:
+            epoch=int(epoch)
             quote_text,digit=extract_last_digit(price,precision)
-            if digit is not None and self.store.add_tick(symbol,int(epoch),quote_text,precision,digit) is not None:
+            if digit is not None and self.store.add_tick(symbol,epoch,quote_text,precision,digit) is not None:
                 inserted += 1
+        self._increment_symbol_status(symbol,"history_seeded_ticks",inserted)
         return inserted
     async def _handle_tick(self, tick, symbol_hint=None):
         symbol=tick.get("symbol") or symbol_hint
         if symbol not in self.settings.symbols: raise ValueError(f"Unexpected symbol {symbol!r}")
-        if "quote" not in tick or "epoch" not in tick or "pip_size" not in tick: raise ValueError("Tick missing quote/epoch/pip_size; refusing to infer")
-        precision=quote_precision(tick["pip_size"])
-        quote_text,digit=extract_last_digit(tick["quote"],precision)
-        if digit is None: raise ValueError(f"Symbol {symbol} has no displayed decimal digit for MATCH contracts")
-        tick_id=self.store.add_tick(symbol,tick["epoch"],quote_text,precision,digit,tick.get("id"))
-        if tick_id is None: return
+        self._increment_symbol_status(symbol,"received_ticks")
+        self._update_symbol_status(symbol,subscription_status="SUBSCRIBED")
+        try:
+            if "quote" not in tick or "epoch" not in tick or "pip_size" not in tick:
+                raise ValueError("Tick missing quote/epoch/pip_size; refusing to infer")
+            epoch=int(tick["epoch"])
+            precision=quote_precision(tick["pip_size"])
+            quote_text,digit=extract_last_digit(tick["quote"],precision)
+            if digit is None: raise ValueError(f"Symbol {symbol} has no displayed decimal digit for MATCH contracts")
+        except (QuotePrecisionError,ValueError,TypeError):
+            self._increment_symbol_status(symbol,"invalid_ticks")
+            raise
+        previous=self.store.history(symbol,limit=1)
+        previous_epoch=int(previous[-1]["epoch"]) if previous else None
+        if previous_epoch is not None and epoch<previous_epoch:
+            self._increment_symbol_status(symbol,"out_of_order_ticks")
+            return False
+        if previous_epoch is not None and epoch==previous_epoch:
+            self._increment_symbol_status(symbol,"duplicate_ticks")
+            return False
+        if previous_epoch is not None and epoch>previous_epoch+1:
+            self._increment_symbol_status(symbol,"missing_tick_count",epoch-previous_epoch-1)
+        tick_id=self.store.add_tick(symbol,epoch,quote_text,precision,digit,tick.get("id"))
+        if tick_id is None:
+            self._increment_symbol_status(symbol,"duplicate_ticks")
+            return False
         self.last_received[symbol]=time.time()
+        self._increment_symbol_status(symbol,"processed_ticks")
+        self._update_symbol_status(
+            symbol,
+            last_error=None,
+            last_tick_epoch=int(tick["epoch"]),
+            last_tick_id=tick_id,
+            analysis_status="WAITING_FOR_HISTORY",
+            strategy_status="WAITING_FOR_HISTORY",
+            signal_generation_status="WAITING_FOR_HISTORY",
+        )
         self.cumulative_counts[symbol][digit] += 1
         # First score prior forecasts with this newly arrived tick; then forecast from history ending here.
         self.store.score_open_forecasts(symbol,tick_id,int(tick["epoch"]),digit)
         self.store.settle_duration_contracts(symbol,tick_id,int(tick["epoch"]),digit)
         history=self.store.history(symbol,limit=1000)
         digits=tuple(int(r["digit"]) for r in history)
-        if len(digits)<self.settings.min_history_ticks: return
+        if len(digits)<self.settings.min_history_ticks:
+            return True
         latest=history[-1]
         ctx=ForecastContext(symbol,int(latest["id"]),int(latest["epoch"]),digits,tuple(self.cumulative_counts[symbol]))
+        self._update_symbol_status(
+            symbol,
+            analysis_status="ANALYZING",
+            strategy_status="ANALYZING",
+            signal_generation_status="GENERATING SIGNALS",
+        )
+        self._increment_symbol_status(symbol,"analysis_runs")
         forecasts=[s.forecast(ctx) for s in self.strategies]
         # Freeze all forecasts synchronously before returning to the stream reader.
         # Quote requests run in background and are separately timestamped append-only events.
@@ -1354,6 +1619,18 @@ class MarketCollector:
         for f in forecasts:
             seq=self.store.append_forecast(symbol,f,tick_id,int(tick["epoch"]),None,self.settings.paper_stake,None,"PAYOUT_PENDING")
             forecast_rows.append((f,seq))
+        generated_at=datetime.now(timezone.utc).isoformat()
+        self._update_symbol_status(
+            symbol,
+            analysis_status="ANALYZED",
+            strategy_status="PROCESSED",
+            signal_generation_status="GENERATED" if forecasts else "NO SIGNALS",
+            last_analysis_at=generated_at,
+            last_signal_at=generated_at if forecasts else None,
+            last_signal_epoch=int(tick["epoch"]) if forecasts else None,
+        )
+        self._increment_symbol_status(symbol,"strategy_runs",len(forecasts))
+        self._increment_symbol_status(symbol,"signals_generated",len(forecasts))
         if len(self.quote_tasks) >= self.settings.max_pending_quote_tasks:
             self._record_error("Proposal queue full; forecast retained without payout quote")
             log.warning("Proposal queue full; skipping quote requests for %s tick %s",symbol,tick_id)
@@ -1361,6 +1638,7 @@ class MarketCollector:
             task=asyncio.create_task(self._capture_quotes(symbol,tick_id,int(tick["epoch"]),forecast_rows))
             self.quote_tasks.add(task)
             task.add_done_callback(self.quote_tasks.discard)
+        return True
 
     async def _capture_quotes(self, symbol, tick_id, epoch, forecast_rows):
         unique=sorted({f.prediction for f,_ in forecast_rows})
@@ -1404,12 +1682,18 @@ class MarketCollector:
         delay=1
         try:
             while True:
+                connected_at=None
                 try:
+                    self._set_connection_status("CONNECTING")
                     async with websockets.connect(self.settings.ws_url,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
+                        connected_at=time.monotonic()
+                        self.connection_started_monotonic=connected_at
+                        self._set_connection_status("CONNECTED")
                         req_symbols={}; subscription_symbols={}
                         # Seed from the latest historical ticks without generating retrospective forecasts.
                         # This avoids waiting 1,000 live seconds before the research engine can start.
                         history_requests={200+index:symbol for index,symbol in enumerate(self.settings.symbols)}
+                        history_status={symbol:"PENDING" for symbol in self.settings.symbols}
                         pending=set(history_requests)
                         for req_id,symbol in history_requests.items():
                             await ws.send(json.dumps({"ticks_history":symbol,"count":1000,"end":"latest","style":"ticks","req_id":req_id}))
@@ -1419,6 +1703,7 @@ class MarketCollector:
                             except asyncio.TimeoutError:
                                 self._record_error("Historical seed timed out; continuing with live ticks only")
                                 break
+                            symbol=None
                             try:
                                 seed_msg=json.loads(raw_history,parse_float=Decimal)
                                 seed_id=seed_msg.get("req_id")
@@ -1427,20 +1712,38 @@ class MarketCollector:
                                 pending.remove(seed_id)
                                 symbol=history_requests[seed_id]
                                 if seed_msg.get("error"):
-                                    self._record_error(f"Historical seed failed for {symbol}: {seed_msg['error'].get('message','Deriv error')}")
+                                    history_status[symbol]="ERROR"
+                                    self._update_symbol_status(symbol,history_seed_status="ERROR")
+                                    error_message=seed_msg["error"].get("message","Deriv error")
+                                    self._record_error(f"Historical seed failed for {symbol}: {error_message}",symbol)
                                     continue
                                 hist=seed_msg.get("history") or {}
                                 inserted=self._seed_history(symbol,hist,seed_msg.get("pip_size"))
+                                history_status[symbol]="READY"
+                                self._update_symbol_status(symbol,history_seed_status="READY")
                                 log.info("Seeded %s historical ticks for %s",inserted,symbol)
                             except (json.JSONDecodeError,QuotePrecisionError,ValueError,KeyError,TypeError) as exc:
-                                self._record_error(f"Historical seed rejected: {exc}")
+                                if symbol is not None:
+                                    history_status[symbol]="ERROR"
+                                    self._update_symbol_status(symbol,history_seed_status="ERROR")
+                                self._record_error(f"Historical seed rejected: {exc}",symbol)
                                 log.exception("Could not seed historical ticks")
                         for symbol in self.settings.symbols:
                             self.cumulative_counts[symbol]=list(self.store.digit_counts(symbol))
+                            if symbol in pending:
+                                history_status[symbol]="TIMEOUT"
+                            if history_status[symbol]!="READY":
+                                self._update_symbol_status(symbol,history_seed_status=history_status[symbol])
                         for index,symbol in enumerate(self.settings.symbols):
                             req_id=100+index; req_symbols[req_id]=symbol
+                            self._update_symbol_status(
+                                symbol,
+                                subscription_status="SUBSCRIBING",
+                            )
+                            self._increment_symbol_status(symbol,"subscription_count")
                             await ws.send(json.dumps({"ticks":symbol,"subscribe":1,"req_id":req_id}))
-                        delay=1
+                        # A normal WebSocket close is also a disconnect; route it through
+                        # the same bounded backoff path as network errors.
                         async for raw in ws:
                             try:
                                 msg=json.loads(raw,parse_float=Decimal)
@@ -1459,24 +1762,49 @@ class MarketCollector:
                                     if hint:
                                         if subscription_id: subscription_symbols[subscription_id]=hint
                                         if tick.get("id"): subscription_symbols[tick["id"]]=hint
-                                    await self._handle_tick(tick,hint)
+                                    try:
+                                        await self._handle_tick(tick,hint)
+                                    except (QuotePrecisionError,ValueError,KeyError,TypeError) as exc:
+                                        self._record_error(f"Rejected malformed tick: {exc}",hint)
+                                        log.exception("Rejected malformed tick: %s",exc)
+                                    except Exception as exc:
+                                        self._record_error(f"Tick processing failed: {exc}",hint)
+                                        self._update_symbol_status(
+                                            hint,
+                                            analysis_status="ERROR",
+                                            strategy_status="ERROR",
+                                            signal_generation_status="ERROR",
+                                        )
+                                        log.exception("Tick processing failed")
                             except (json.JSONDecodeError,QuotePrecisionError,ValueError,KeyError,TypeError) as exc:
                                 self._record_error(exc)
                                 log.exception("Rejected malformed tick: %s",exc)
+                    if connected_at is not None and time.monotonic()-connected_at>=60:
+                        delay=1
+                    self._set_connection_status("RECONNECTING","Deriv closed the tick stream",reconnect=True)
+                    log.warning("Deriv closed the tick stream; reconnecting in %ss",delay)
+                    await asyncio.sleep(delay)
+                    delay=min(delay*2,30)
                 except asyncio.CancelledError:
+                    self._set_connection_status("DISCONNECTED")
                     raise
                 except Exception as exc:
                     self._record_error(exc)
+                    if connected_at is not None and time.monotonic()-connected_at>=60:
+                        delay=1
+                    self._set_connection_status("RECONNECTING",str(exc),reconnect=True)
                     log.exception("Market stream disconnected; reconnecting in %ss",delay)
                     await asyncio.sleep(delay)
                     delay=min(delay*2,30)
+                finally:
+                    self.connection_started_monotonic=None
         finally:
+            if self.connection_status!="DISCONNECTED":
+                self._set_connection_status("DISCONNECTED")
             for task in tuple(self.quote_tasks): task.cancel()
             if self.quote_tasks:
                 await asyncio.gather(*tuple(self.quote_tasks),return_exceptions=True)
 ```
-
----
 
 ## `bromax/config.py`
 
@@ -1538,8 +1866,6 @@ class Settings:
             max_pending_quote_tasks=int(os.getenv("MAX_PENDING_QUOTE_TASKS", "20")),
         )
 ```
-
----
 
 ## `bromax/dashboard.html`
 
@@ -1621,8 +1947,6 @@ $('symbol').addEventListener('change',e=>{state.symbol=e.target.value;refreshAll
 </script></body></html>
 ```
 
----
-
 ## `bromax/dashboard_minimal.html`
 
 ```html
@@ -1634,7 +1958,7 @@ $('symbol').addEventListener('change',e=>{state.symbol=e.target.value;refreshAll
 <title>BROMAX — Decision Terminal</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.status.warn{color:var(--amber)}.status.warn .light{background:var(--amber)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}.ops-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.ops-grid .value{font-size:13px}.history-wrap{overflow:auto;max-height:230px;margin-top:8px}.history-table{min-width:600px}.last-error{margin:8px 0 0;color:var(--red);overflow-wrap:anywhere}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
 </style>
 </head>
 <body>
@@ -1645,9 +1969,29 @@ $('symbol').addEventListener('change',e=>{state.symbol=e.target.value;refreshAll
     <div class="market">
       <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
       <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
-      <div class="market-item"><span class="label">Latest tick · last digit</span><strong class="value" id="latestTick">—</strong></div>
+      <div class="market-item"><span class="label">Latest tick · digit · market time</span><strong class="value" id="latestTick">—</strong></div>
       <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
     </div>
+  </section>
+
+  <section class="section" aria-labelledby="pipeline-heading">
+    <div class="section-title"><h2 id="pipeline-heading">Live analysis pipeline</h2><strong class="status" id="pipelineStatus"><i class="light"></i><span>WAITING</span></strong></div>
+    <div class="ops-grid">
+      <div><span class="label">Subscription</span><strong class="value" id="subscriptionStatus">—</strong></div>
+      <div><span class="label">Analysis engine</span><strong class="value" id="analysisStatus">—</strong></div>
+      <div><span class="label">Strategy processing</span><strong class="value" id="strategyStatus">—</strong></div>
+      <div><span class="label">Signal generation</span><strong class="value" id="generationStatus">—</strong></div>
+      <div><span class="label">Ticks received / processed</span><strong class="value" id="tickCounts">—</strong></div>
+      <div><span class="label">Signals recorded</span><strong class="value" id="signalsRecorded">—</strong></div>
+      <div><span class="label">Missed tick epochs</span><strong class="value" id="missingTicks">—</strong></div>
+      <div><span class="label">Out-of-order / invalid / duplicate</span><strong class="value" id="badTicks">—</strong></div>
+    </div>
+    <p class="last-error" id="pipelineError" hidden></p>
+    <div class="history-wrap"><table class="history-table">
+      <thead><tr><th>Time</th><th>Strategy</th><th>Digit</th><th>Probability</th><th>Signal status</th></tr></thead>
+      <tbody id="signalHistory"><tr><td colspan="5" class="muted">No persisted strategy forecasts yet.</td></tr></tbody>
+    </table></div>
+    <p class="note">Forecasts are analysis records, not trade instructions. No order is placed.</p>
   </section>
 
   <section class="section signal" aria-labelledby="signal-heading">
@@ -1701,20 +2045,48 @@ const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.N
 const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
 function renderMarket(decision){
-  const symbol=decision.symbol,market=decision.market_status||{},tick=market.latest_tick;
+  const symbol=decision.symbol,market=decision.market_status||{},pipeline=decision.pipeline||{},tick=market.latest_tick;
   state.currency=decision.currency||'USD';
   $('marketSymbol').textContent=symbol;
-  const connected=Boolean(market.connected);
-  const connection=$('connection');connection.className=`status ${connected?'good':'bad'}`;
-  connection.querySelector('span').textContent=connected?'CONNECTED':'STALE / NOT APPROVED';
+  const receiving=market.data_status==='RECEIVING DATA';
+  const statusText=market.connection_status||'DISCONNECTED';
+  const connection=$('connection');
+  connection.className=`status ${statusText==='CONNECTED'?(receiving?'good':'warn'):statusText==='CONNECTING'||statusText==='RECONNECTING'?'warn':'bad'}`;
+  connection.querySelector('span').textContent=statusText;
   if(tick){
     const age=market.freshness_seconds;
-    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
-    $('freshness').textContent=`${connected?'FRESH':'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
-    $('freshness').className=`value ${connected?'good-text':'bad-text'}`;
+    const tickTime=tick.epoch?new Date(Number(tick.epoch)*1000).toLocaleTimeString():'—';
+    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit} · ${tickTime}`;
+    $('freshness').textContent=`${market.data_status||'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
+    $('freshness').className=`value ${receiving?'good-text':'bad-text'}`;
   }else{
     $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
   }
+  const pipelineStatus=$('pipelineStatus');
+  const pipelineText=pipeline.pipeline_status||'WAITING';
+  const good=pipelineText==='GENERATING SIGNALS'||pipelineText==='ANALYZING'||pipelineText==='RECEIVING DATA';
+  const warn=pipelineText==='CONNECTED'||pipelineText==='CONNECTING';
+  pipelineStatus.className=`status ${good?'good':warn?'warn':'bad'}`;
+  pipelineStatus.querySelector('span').textContent=pipelineText;
+  $('subscriptionStatus').textContent=pipeline.subscription_status||'—';
+  $('analysisStatus').textContent=pipeline.analysis_status||'—';
+  $('strategyStatus').textContent=pipeline.strategy_status||'—';
+  $('generationStatus').textContent=pipeline.signal_generation_status||'—';
+  $('tickCounts').textContent=`${pipeline.received_ticks??0} / ${pipeline.processed_ticks??0}`;
+  $('signalsRecorded').textContent=String(pipeline.signals_generated??0);
+  $('missingTicks').textContent=String(pipeline.missing_tick_count??0);
+  $('badTicks').textContent=`${pipeline.out_of_order_ticks??0} / ${pipeline.invalid_ticks??0} / ${pipeline.duplicate_ticks??0}`;
+  const error=$('pipelineError');
+  error.textContent=pipeline.last_error||pipeline.connection_error||(pipeline.recent_errors||[]).join(' · ');
+  error.hidden=!error.textContent;
+}
+function renderSignalHistory(data){
+  const rows=data?.signals||[];
+  $('signalHistory').innerHTML=rows.length?rows.slice().reverse().map(row=>{
+    const time=row.created_at?new Date(row.created_at).toLocaleTimeString():'—';
+    const confidence=row.confidence==null?'—':pct(row.confidence);
+    return `<tr><td class="num">${safe(time)}</td><td>${safe(row.strategy_id)}</td><td class="num">${safe(row.prediction)}</td><td class="num">${safe(confidence)}</td><td>${safe(row.status)}</td></tr>`;
+  }).join(''):'<tr><td colspan="5" class="muted">No persisted strategy forecasts yet.</td></tr>';
 }
 function renderSignal(decision){
   const signal=decision?.trade_authorized===true?decision.signal:null;
@@ -1765,6 +2137,10 @@ function renderPaper(performance){
 }
 function renderUnavailable(error){
   const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
+  const pipelineStatus=$('pipelineStatus');pipelineStatus.className='status bad';pipelineStatus.querySelector('span').textContent='ERROR';
+  for(const id of ['subscriptionStatus','analysisStatus','strategyStatus','generationStatus','tickCounts','signalsRecorded','missingTicks','badTicks'])$(id).textContent='—';
+  $('pipelineError').textContent=`API unavailable: ${error.message}`;$('pipelineError').hidden=false;
+  $('signalHistory').innerHTML=`<tr><td colspan="5" class="error">Signal history unavailable: ${safe(error.message)}</td></tr>`;
   $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
   $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
   $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
@@ -1773,8 +2149,12 @@ function renderUnavailable(error){
 }
 async function refresh(){
   try{
-    const decision=await api(`/decision?symbol=${encodeURIComponent(state.symbol)}`);
+    const [decision,history]=await Promise.all([
+      api(`/decision?symbol=${encodeURIComponent(state.symbol)}`),
+      api(`/signals/history?symbol=${encodeURIComponent(state.symbol)}&limit=10`)
+    ]);
     renderMarket(decision);
+    renderSignalHistory(history);
     renderSignal(decision);
     renderDigits(decision);
     renderVolatility(decision);
@@ -1790,8 +2170,6 @@ refresh();setInterval(refresh,3000);
 </body>
 </html>
 ```
-
----
 
 ## `bromax/desktop.py`
 
@@ -1986,8 +2364,6 @@ if __name__=="__main__":
     main()
 ```
 
----
-
 ## `bromax/digits.py`
 
 ```python
@@ -2033,8 +2409,6 @@ def extract_last_digit(quote: str | int | Decimal, pip_size: int | str | Decimal
         return text, None
     return text, int(text[-1])
 ```
-
----
 
 ## `bromax/intelligence.py`
 
@@ -2146,8 +2520,6 @@ def analyze_ticks(ticks, symbol: str, window: int = 1000):
     }
 ```
 
----
-
 ## `bromax/paperbot.py`
 
 ```python
@@ -2156,11 +2528,28 @@ import time
 from decimal import Decimal
 import json
 from pathlib import Path
+from threading import Event
+
+_LIVE_KILL_SWITCH = Event()
+_LIVE_KILL_SWITCH.set()
 
 class ExecutionInterface:
-    """Deliberately disabled interface. No buy/sell methods exist in BROMAX."""
+    """Fail-closed execution boundary with a one-way emergency kill switch."""
     enabled = False
+
+    def __init__(self):
+        self._kill_switch = _LIVE_KILL_SWITCH
+
+    @property
+    def kill_switch_engaged(self):
+        return self._kill_switch.is_set()
+
+    def engage_kill_switch(self):
+        self._kill_switch.set()
+
     async def execute(self, *args, **kwargs):
+        if self.kill_switch_engaged:
+            raise RuntimeError("Emergency kill switch is engaged; execution is blocked")
         raise RuntimeError("Live execution is intentionally not implemented or enabled")
 
 class PaperBot:
@@ -2230,8 +2619,6 @@ class PaperBot:
         self.store.append_paper_open(symbol,forecast,forecast_seq,tick_id,epoch,stake,payout,proposal_id,spot_time)
         return "paper_trade_opened"
 ```
-
----
 
 ## `bromax/proposals.py`
 
@@ -2313,8 +2700,6 @@ class ProposalClient:
             raise ProposalUnavailable(str(exc)) from exc
 ```
 
----
-
 ## `bromax/reporting.py`
 
 ```python
@@ -2352,8 +2737,6 @@ def write_report(store, symbols, path="reports/bromax_report.json"):
     p=Path(path); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(report,indent=2,default=str))
     return report
 ```
-
----
 
 ## `bromax/research.py`
 
@@ -2758,8 +3141,6 @@ def generate_report(store, symbols):
     return {"report_version":"1.0.0","pre_registration":PRE_REGISTERED,"symbols":reports}
 ```
 
----
-
 ## `bromax/storage.py`
 
 ```python
@@ -2851,7 +3232,7 @@ class Store:
             return cur.lastrowid
     def history(self, symbol, limit=1000):
         with self.connect() as c:
-            rows = c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY id DESC LIMIT ?",(symbol,limit)).fetchall()
+            rows = c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY epoch DESC,id DESC LIMIT ?",(symbol,limit)).fetchall()
         return list(reversed(rows))
     def digit_counts(self, symbol):
         with self.connect() as c:
@@ -2899,7 +3280,7 @@ class Store:
 
     def is_latest_tick(self, symbol, tick_id):
         with self.connect() as c:
-            row=c.execute("SELECT id FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT 1",(symbol,)).fetchone()
+            row=c.execute("SELECT id FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT 1",(symbol,)).fetchone()
         return bool(row and row[0]==tick_id)
 
     def forecasts(self, symbol=None, limit=None):
@@ -3008,7 +3389,7 @@ class Store:
     def quality_history(self, symbol, limit=20):
         with self.connect() as c:
             rows=c.execute(
-                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",
+                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY epoch DESC,id DESC LIMIT ?",
                 (symbol,max(1,int(limit))),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
@@ -3048,11 +3429,9 @@ class Store:
     def ticks_frame(self, symbol):
         import pandas as pd
         with self.connect() as c:
-            rows=c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY id",(symbol,)).fetchall()
+            rows=c.execute("SELECT id,epoch,digit,quote_text FROM ticks WHERE symbol=? AND digit IS NOT NULL ORDER BY epoch,id",(symbol,)).fetchall()
         return pd.DataFrame([dict(r) for r in rows])
 ```
-
----
 
 ## `bromax/strategies.py`
 
@@ -3181,8 +3560,6 @@ def candidate_strategies():
             LaplaceFrequency(100, 1.0), LaplaceFrequency(500, 1.0),
             ExponentialFrequency(50), ExponentialFrequency(200), ConditionalTransition()]
 ```
-
----
 
 ## `bromax/timing.py`
 
@@ -3435,838 +3812,94 @@ def evaluate_payout_timing(duration_events, min_holdout=5000):
             'limitations':['Expected value is calculated from actual quoted gross payout and stake, then realized against the exact future digit.','Only prospective quote-and-settlement pairs count; historical tick data cannot reconstruct past proposal prices.','A positive result is historical evidence, not a guarantee. Forward paper operation and risk approval remain mandatory.','No live contract purchase is enabled.']}
 ```
 
----
+## `CHANGELOG.md`
 
-## `tests/test_agents.py`
+```markdown
+## Live market pipeline visibility
+- Added per-symbol connection, subscription, tick-quality, analysis, strategy, signal-generation, freshness, and error state to collector monitoring.
+- Reconnects after both network failures and normal WebSocket closure, then restores history context and tick subscriptions.
+- Backfilled older missing history without retrospective forecasts; all tick-history readers sort by market epoch.
+- Ignored duplicate epochs, dropped delayed out-of-order live ticks, and counted epoch gaps without disrupting the stream.
+- Added `/signals/history` for persisted strategy forecasts and surfaced pipeline status and signal history in the primary dashboard.
+- Kept existing strategy calculations, quote handling, signal qualification, and paper-only execution boundaries unchanged.
+- Added focused collector, reconnect, API, and dashboard tests.
 
-```python
-from datetime import datetime, timedelta, timezone
+## Live-execution safety foundation
+- Added a process-wide, default-engaged, one-way execution kill switch and `POST /safety/kill-switch`.
+- Kept live execution unimplemented and disabled; the endpoint cannot clear the switch or place orders.
+- Added tests confirming the guard blocks execution and the API reports live execution remains unavailable.
 
-from bromax.agents import (
-    AgentResult,
-    ChiefIntelligenceCoordinator,
-    DataIntelligenceAgent,
-    PerformanceLearningAgent,
-    ProbabilityCalibrationAgent,
-)
-from bromax.storage import Store
+## Deterministic multi-agent decision snapshot
+- Added eight typed specialist/coordinator roles that reuse existing research, calibration, volatility, quote, risk, and paper-ledger calculations; no LLM output can generate probabilities or authorize trades.
+- Added `GET /decision` as the synchronized source for the minimal dashboard and Windows floating panel, including same-tick consistency checks and fail-closed signal approval.
+- Added immutable, throttled agent-run persistence and focused tests for data quality, no-trade vetoes, persistence, and snapshot synchronization.
 
+## 2.2.1
+- Changed the local BROMAX web/API listening port from 8000 to 8765 to avoid the previously occupied port. Updated launch command and dashboard URL.
+- Replaced the primary dashboard with a compact five-section decision terminal; retained the detailed dashboard at `/advanced`.
+- Added a fail-closed signal card that requires both the existing READY checks and the stricter per-digit evidence decision.
+- Reduced the always-on-top Windows panel to the same six decision fields and kept polling off the Tkinter UI thread.
+- Added holdout-derived current-regime volatility health and rejection reasons without changing research selection or approval statistics.
+- Added ten-digit research cards, evidence-quality health scores, duration breakdowns, and paper-performance breakdowns to the dashboard and `GET /digits/analysis`.
+- Added a synchronized Windows floating panel with always-on-top and compact modes; the standard launcher opens it with the dashboard.
+- Kept missing model estimates blank and trade decisions fail-closed until per-digit evidence, quote, timing, manual-approval, and paper-risk checks pass.
+- Added focused API, forecast-ordering, and per-digit research coverage; documented the endpoint and panel.
 
-def _ticks(count=3):
-    received = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-    return [
-        {
-            "id": index + 1,
-            "epoch": 100 + index,
-            "quote_text": f"1.{20 + index:02d}",
-            "pip_size": 2,
-            "digit": index,
-            "received_utc": received,
-        }
-        for index in range(count)
-    ]
+# BROMAX 2.2.0 — 18 November 2026
 
+Earlier 2.1.0 release notes are retained below for traceability.
 
-def test_data_agent_approves_only_fresh_contiguous_precision_checked_ticks():
-    result = DataIntelligenceAgent().run(_ticks(), False, 5)
-    assert result.status == "APPROVED"
-    assert result.metrics["quality_score"] == 100
+## Multi-tick timing research
+- Added a dedicated 1–5 tick horizon evaluator that scores frozen forecasts against the digit exactly N observed ticks later. Missing 1-second epochs are excluded rather than silently shifted.
+- Added chronological development (60%), validation (20%), and untouched final-test (20%) splits, Wilson confidence intervals, and Holm multiple-comparison correction across strategy-duration candidates.
+- Reports a research lead only when validation and final-test hit-rate evidence pass minimum-sample and significance gates. This is not an execution approval.
 
-    malformed = _ticks()
-    malformed[-1]["digit"] = 9
-    result = DataIntelligenceAgent().run(malformed, False, 5)
-    assert result.status == "REJECTED"
-    assert "quote" in result.reasons[0].lower() or "missing tick" in result.reasons[0].lower()
+## Volatility diagnostics
+- Added trailing 20-return absolute-volatility measurements and development-trained tercile regimes (LOW/MID/HIGH).
+- Displays regime-specific sample sizes and holdout results alongside timing candidates.
+- Added a fail-closed volatility gate to the READY panel: a one-tick signal is rejected unless the matching strategy and current volatility regime pass minimum-sample, untouched final-test confidence-bound, and Holm-adjusted significance checks. This can intentionally leave the system at NO TRADE until enough evidence exists.
 
-
-def test_data_agent_rejects_stale_feed_even_if_stored_ticks_look_valid():
-    result = DataIntelligenceAgent().run(_ticks(), True, 5)
-    assert result.status == "REJECTED"
-    assert result.metrics["checks"]["fresh"] is False
-
-
-def test_probability_agent_keeps_missing_estimates_missing():
-    analysis = {"digits":[
-        {"digit":digit,"estimated_win_probability":None,"health_percent":None}
-        for digit in range(10)
-    ]}
-    result = ProbabilityCalibrationAgent().run(analysis,{"signals":[]})
-    assert result.status == "INSUFFICIENT_EVIDENCE"
-    assert result.metrics["valid_digit_estimates"] == 0
+## Safety and limitations
+- Added `GET /timing?symbol=...` and a dashboard timing/volatility research panel.
+- The existing paper executor remains one tick. Multi-tick execution is deliberately not enabled because BROMAX does not yet capture duration-specific quotes or validate payout-adjusted EV for 2–5 tick contracts.
+- Paper-only mode remains; no live order endpoint, authentication, or buy/sell capability was added.
+- No timing can be described as guaranteed or worth risking essential funds on. If evidence is insufficient, the result is no validated timing.
 
 
-def test_performance_agent_reports_only_recorded_paper_outcomes():
-    result = PerformanceLearningAgent().run([],[],[])
-    assert result.status == "INSUFFICIENT_EVIDENCE"
-    assert result.metrics["paper_opened"] == 0
-    assert result.metrics["win_rate"] is None
-    assert result.metrics["net_paper_profit"] is None
-
-
-def test_agent_run_persistence_is_immutable_and_throttled_by_decision(tmp_path):
-    store = Store(str(tmp_path / "agent-runs.sqlite3"))
-    agents = [{"agent_id": "chief_intelligence_coordinator", "status": "INSUFFICIENT_EVIDENCE"}]
-    assert store.record_agent_run("snapshot-1", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
-    assert not store.record_agent_run("snapshot-2", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
-    assert store.record_agent_run("snapshot-3", "1HZ100V", 7, "NO TRADE", "NO TRADE|digit=4", agents)
-    runs = store.agent_runs("1HZ100V")
-    assert [run["snapshot_id"] for run in runs] == ["snapshot-3", "snapshot-1"]
-    assert runs[0]["agent_results"] == agents
-    with store.connect() as connection:
-        try:
-            connection.execute("UPDATE agent_runs SET final_status='TRADE'")
-        except Exception:
-            pass
-        else:
-            raise AssertionError("agent run records must be immutable")
-
-
-def test_coordinator_vetoes_even_an_approved_specialist_result_on_mixed_snapshot():
-    risk = AgentResult(
-        agent_id="risk_signal_approval",
-        status="APPROVED",
-        evaluated_at=datetime.now(timezone.utc).isoformat(),
-        duration_ms=1,
-        summary="approved",
-        reasons=(),
-        metrics={},
-        output={"trade_authorized": True, "signal": {"predicted_digit": 2}},
-    )
-    result = ChiefIntelligenceCoordinator().coordinate([], risk, consistent=False)
-    assert result.status == "INSUFFICIENT_EVIDENCE"
-    assert result.output["trade_authorized"] is False
-    assert result.output["final_status"] == "NO TRADE — INSUFFICIENT EVIDENCE"
+## 2.2.0 — 2026-11-18
+- Added live read-only Deriv proposal quote capture for 1–5 tick MATCH durations using batched WebSocket requests.
+- Added append-only duration quote and settlement ledger with exact target-epoch matching.
+- Added actual payout-adjusted realized P/L evaluation, chronological holdouts, HAC confidence intervals, and Holm correction.
+- Added quote-backed profitability panel to the existing new dashboard.
+- Added a fail-closed paper-entry gate requiring confirmed profitability for the exact one-tick executor strategy.
+- Kept live execution disabled; multi-tick durations remain research-only until duration-aware paper execution is built.
 ```
 
----
+## `Dockerfile`
 
-## `tests/test_api.py`
+```text
+FROM python:3.12-slim
 
-```python
-import pytest
+WORKDIR /app
 
-def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path, monkeypatch):
-    import importlib
-    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"api.sqlite3"))
-    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
-    import bromax.api as api_module
-    api_module=importlib.reload(api_module)
-    paths={route.path for route in api_module.app.routes}
-    assert "/health" in paths
-    assert "/report" in paths
-    assert "/paper/trades" in paths
-    assert "/intelligence" in paths
-    assert "/signals" in paths
-    assert "/signals/ready" in paths
-    assert "/decision" in paths
-    assert "/timing" in paths
-    assert "/bridge/status" in paths
-    assert "/dashboard" in paths
-    assert "/advanced" in paths
-    assert "/digits/analysis" in paths
-    assert not any("buy" in path.lower() or "live" in path.lower() for path in paths)
-    assert api_module.paper_status()["mode"]=="SIMULATED_ONLY"
-    bridge=api_module.bridge_status()
-    assert bridge["execution"]=="paper_only_no_buy_endpoint"
-    assert bridge["mode"]=="SIMULATED_ONLY"
-    page=api_module.dashboard()
-    assert "BROMAX" in page
-    assert "Best trading signal" in page
-    assert "NO QUALIFIED SIGNAL" in page
-    assert "Digit prediction" in page
-    assert page.count("<section ")==5
-    assert "/decision?symbol=" in page
-    assert "/digits/analysis?symbol=" not in page
-    assert "Timing & volatility research" not in page
-    advanced=api_module.advanced_dashboard()
-    assert "Ready to trade" in advanced
-    assert 'href="/dashboard"' in advanced
-    ready=api_module.ready_signal("1HZ100V")
-    assert ready["eligible"] is False
-    assert ready["status"] == "WAITING"
-    assert api_module.intelligence("1HZ100V",100)["signal_status"]=="RESEARCH_ONLY_NOT_APPROVED"
-    assert api_module.signals("1HZ100V")["trade_authorized"] is False
-    timing = api_module.timing_research("1HZ100V")
-    assert timing["execution_authorized"] is False
-    assert timing["durations_tested_ticks"] == [1, 2, 3, 4, 5]
-    assert "payout_optimization" in timing
-    assert timing["payout_optimization"]["execution_authorized"] is False
+COPY pyproject.toml ./
+COPY app.py ./
+COPY bromax ./bromax
 
+RUN pip install --no-cache-dir . \
+    && mkdir -p /data
 
-def test_unified_decision_returns_one_persisted_no_trade_snapshot(monkeypatch, tmp_path):
-    import importlib
-    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"decision.sqlite3"))
-    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
-    import bromax.api as api_module
-    api_module=importlib.reload(api_module)
-    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{}}]})
-    monkeypatch.setattr(api_module,"digit_analysis",lambda symbol:{
-        "latest_tick":None,"volatility_filter":{"status":"INSUFFICIENT DATA"},
-        "digits":[{"digit":digit,"estimated_win_probability":None,"health_percent":None,
-                   "decision":"DO NOT TRADE","reasons":["Insufficient validated evidence."]}
-                  for digit in range(10)],
-    })
-    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[],"trade_authorized":False})
-    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[]})
-    monkeypatch.setattr(api_module,"ready_signal",lambda symbol:{
-        "symbol":symbol,"status":"WAITING","eligible":False,"signal":None,
-        "reason":"No statistically approved quote-backed signal.",
-    })
+ENV DATABASE_PATH=/data/bromax.sqlite3 \
+    BROMAX_REQUIRE_AUTH=true
 
-    first=api_module.unified_decision("1HZ100V")
-    second=api_module.unified_decision("1HZ100V")
-    assert first["trade_authorized"] is False
-    assert first["final_status"]=="NO TRADE — INSUFFICIENT EVIDENCE"
-    assert len(first["digits"])==10
-    assert len(first["agents"])==8
-    assert first["agent_run_persisted"] is True
-    assert second["agent_run_persisted"] is False
-    assert len(api_module.store.agent_runs("1HZ100V"))==1
-    assert {agent["evaluated_at"] for agent in first["agents"]}=={first["created_at"]}
+EXPOSE 8765
 
-def test_digit_analysis_returns_all_digits_without_inventing_estimates(monkeypatch, tmp_path):
-    import importlib
-    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"digit-analysis.sqlite3"))
-    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
-    import bromax.api as api_module
-    api_module=importlib.reload(api_module)
-    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{"selected_strategy_id":None,"digits":[]}}]})
-    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[]})
-    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[],"payout_optimization":{}})
-    result=api_module.digit_analysis("1HZ100V")
-    assert [row["digit"] for row in result["digits"]]==list(range(10))
-    assert result["trade_authorized"] is False
-    assert all(row["estimated_win_probability"] is None for row in result["digits"])
-    assert all(row["health_percent"] is None for row in result["digits"])
-    assert all(row["decision"]=="DO NOT TRADE" for row in result["digits"])
-    assert result["volatility_filter"]["health_percent"] is None
-
-def test_volatility_health_uses_observed_holdout_checks(monkeypatch, tmp_path):
-    import importlib
-    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"volatility-health.sqlite3"))
-    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
-    import bromax.api as api_module
-    api_module=importlib.reload(api_module)
-    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{"selected_strategy_id":"candidate","digits":[]}}]})
-    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[{
-        "strategy_id":"candidate","version":"1.0","predicted_digit":0,
-        "predicted_digit_probability":.1,"probabilities":[.1]*10,
-    }]})
-    holdout={"n":1000,"hit_rate_ci95":[.11,.14],"holm_adjusted_p":.01}
-    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{
-        "current_volatility_regime":"LOW",
-        "strategies":[{"strategy_id":"candidate","duration_ticks":1,"volatility_regimes":[
-            {"regime":"LOW","status":"CONFIRMED_FOR_THIS_STRATEGY_AND_HORIZON","validation":holdout,"final_test":holdout}
-        ]}],
-        "payout_optimization":{},
-    })
-    result=api_module.digit_analysis("1HZ100V")
-    assert result["volatility_filter"]["status"]=="PASS"
-    assert result["volatility_filter"]["health_percent"]==100
-    assert result["volatility_filter"]["checks_passed"]==6
-
-@pytest.mark.asyncio
-async def test_cloud_basic_auth_protects_dashboard_and_api(monkeypatch, tmp_path):
-    import base64
-    import importlib
-    import httpx
-
-    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"protected.sqlite3"))
-    monkeypatch.setenv("BROMAX_REQUIRE_AUTH","true")
-    monkeypatch.setenv("BROMAX_AUTH_USERNAME","viewer")
-    monkeypatch.setenv("BROMAX_AUTH_PASSWORD","test-password")
-    import bromax.api as api_module
-    api_module=importlib.reload(api_module)
-    transport=httpx.ASGITransport(app=api_module.app)
-    async with httpx.AsyncClient(transport=transport,base_url="http://test") as client:
-        denied=await client.get("/dashboard")
-        assert denied.status_code==401
-        assert "Basic" in denied.headers["www-authenticate"]
-        credentials=base64.b64encode(b"viewer:test-password").decode("ascii")
-        allowed=await client.get("/dashboard",headers={"Authorization":f"Basic {credentials}"})
-        assert allowed.status_code==200
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8765}"]
 ```
-
----
-
-## `tests/test_digits.py`
-
-```python
-from decimal import Decimal
-import pytest
-from bromax.digits import extract_last_digit, quote_precision, QuotePrecisionError
-
-@pytest.mark.parametrize("symbol,quote,pip_size,expected_text,expected_digit",[
-    ("1HZ100V","1234.50",2,"1234.50",0),
-    ("1HZ100V",Decimal("1234.5"),2,"1234.50",0),
-    ("1HZ100V","1234.56",2,"1234.56",6),
-    ("1HZ15V","987.1",3,"987.100",0),
-    ("R_100","987.123",3,"987.123",3),
-    ("R_50","100.00",2,"100.00",0),
-    ("R_10","42",2,"42.00",0),
-])
-def test_last_displayed_digit_by_symbol_precision(symbol,quote,pip_size,expected_text,expected_digit):
-    assert extract_last_digit(quote,pip_size)==(expected_text,expected_digit)
-
-def test_zero_decimal_precision_has_no_decimal_digit():
-    assert extract_last_digit("1234",0)==("1234",None)
-
-def test_rejects_nonzero_excess_precision():
-    with pytest.raises(QuotePrecisionError): extract_last_digit("1.234",2)
-
-def test_rejects_bad_precision():
-    with pytest.raises(QuotePrecisionError): quote_precision("2.5")
-
-
-def test_binary_float_quotes_are_rejected():
-    with pytest.raises(QuotePrecisionError): extract_last_digit(1234.5,2)
-```
-
----
-
-## `tests/test_leakage.py`
-
-```python
-import pytest
-from bromax.strategies import ForecastContext, candidate_strategies
-
-def test_forecast_context_contains_only_observed_history():
-    ctx=ForecastContext("1HZ100V",101,1700000000,(1,2,3,4))
-    assert ctx.history==(1,2,3,4)
-    assert not hasattr(ctx,"next_tick_digit")
-    assert not hasattr(ctx,"actual_next_digit")
-
-class DeliberatePeek:
-    strategy_id="deliberate_peek"
-    version="test"
-    parameters={}
-    def forecast(self,context):
-        # This must fail: no future outcome is supplied to the forecasting interface.
-        return context.next_tick_digit
-
-def test_deliberate_lookahead_attempt_fails():
-    ctx=ForecastContext("1HZ100V",101,1700000000,(1,2,3,4))
-    with pytest.raises(AttributeError): DeliberatePeek().forecast(ctx)
-
-def test_candidate_forecasts_are_valid_and_use_only_context():
-    ctx=ForecastContext("1HZ100V",101,1700000000,tuple([i%10 for i in range(100)]))
-    for strategy in candidate_strategies():
-        forecast=strategy.forecast(ctx)
-        assert 0 <= forecast.prediction <= 9
-        assert len(forecast.probabilities)==10
-        assert sum(forecast.probabilities)==pytest.approx(1.0)
-
-
-def test_execution_interface_is_disabled_and_raises():
-    import asyncio
-    from bromax.paperbot import ExecutionInterface
-    interface=ExecutionInterface()
-    assert interface.enabled is False
-    with pytest.raises(RuntimeError): asyncio.run(interface.execute())
-
-
-def test_batch_backtest_matches_online_strategy_definitions():
-    import pandas as pd
-    from bromax.research import _forecast_frame
-    from bromax.strategies import candidate_strategies, ForecastContext
-    digits=[(i*7+3)%10 for i in range(1200)]
-    ticks=pd.DataFrame({"id":range(1,1201),"epoch":range(1700000000,1700001200),"digit":digits})
-    frame=_forecast_frame(ticks,"1HZ100V")
-    row=frame[(frame.tick_index==1099)&(frame.strategy_id=="exp_frequency_hl50")].iloc[0]
-    ctx=ForecastContext("1HZ100V",1100,1700001099,tuple(digits[100:1100]),tuple(__import__("numpy").bincount(digits[:1100],minlength=10)))
-    online=next(s for s in candidate_strategies() if s.strategy_id=="exp_frequency_hl50").forecast(ctx)
-    assert int(row.prediction)==online.prediction
-    assert list(row.probabilities)==pytest.approx(list(online.probabilities))
-
-
-def test_cumulative_mode_uses_only_past_count_summary():
-    import numpy as np
-    from bromax.strategies import CumulativeMode
-    counts=tuple(np.bincount([1,1,2,2,2],minlength=10))
-    ctx=ForecastContext("1HZ100V",5,1004,(1,1,2,2,2),counts)
-    assert CumulativeMode().forecast(ctx).prediction==2
-
-
-def test_proposal_amount_is_encoded_as_exact_json_decimal():
-    import json
-    from decimal import Decimal
-    from bromax.proposals import encode_proposal_request
-    raw=encode_proposal_request("1HZ100V",3,Decimal("1.20"),"USD",1,99)
-    assert '"amount": 1.20' in raw
-    assert json.loads(raw)["amount"]==1.2
-
-
-def test_changing_future_digit_cannot_change_forecast_at_prior_tick():
-    import pandas as pd
-    from bromax.research import _forecast_frame
-    digits=[(i*3+7)%10 for i in range(1100)]
-    first=pd.DataFrame({"id":range(1,1101),"epoch":range(1700000000,1700001100),"digit":digits})
-    changed=digits.copy(); changed[1000]=(changed[1000]+1)%10
-    second=first.copy(); second["digit"]=changed
-    a=_forecast_frame(first,"1HZ100V")
-    b=_forecast_frame(second,"1HZ100V")
-    ra=a[a.tick_index==999].sort_values("strategy_id")
-    rb=b[b.tick_index==999].sort_values("strategy_id")
-    assert ra.prediction.tolist()==rb.prediction.tolist()
-    assert list(ra.probabilities)==list(rb.probabilities)
-
-
-def test_cumulative_mode_batch_prediction_matches_live_context():
-    import pandas as pd
-    import numpy as np
-    from bromax.research import _forecast_frame
-    from bromax.strategies import CumulativeMode, ForecastContext
-    digits=[(i*11+5)%10 for i in range(1200)]
-    ticks=pd.DataFrame({"id":range(1,1201),"epoch":range(1700000000,1700001200),"digit":digits})
-    frame=_forecast_frame(ticks,"1HZ100V")
-    row=frame[(frame.tick_index==1099)&(frame.strategy_id=="cumulative_mode")].iloc[0]
-    ctx=ForecastContext("1HZ100V",1100,1700001099,tuple(digits[100:1100]),tuple(np.bincount(digits[:1100],minlength=10)))
-    live=CumulativeMode().forecast(ctx)
-    assert int(row.prediction)==live.prediction
-    assert list(row.probabilities)==pytest.approx(list(live.probabilities))
-
-
-def test_proposal_request_rejects_binary_float_stake():
-    from bromax.proposals import encode_proposal_request
-    with pytest.raises(ValueError): encode_proposal_request("1HZ100V",3,1.2,"USD",1,100)
-
-
-def test_historical_seed_uses_pip_size_and_never_creates_forecasts(tmp_path):
-    from bromax.collector import MarketCollector
-    from bromax.config import Settings
-    from bromax.storage import Store
-    from decimal import Decimal
-    store=Store(tmp_path/"seed.sqlite3")
-    settings=Settings(database_path=str(tmp_path/"seed.sqlite3"),min_history_ticks=1000)
-    collector=MarketCollector(settings,store)
-    inserted=collector._seed_history("1HZ100V",{"prices":[Decimal("1234.5"),Decimal("1234.51")],"times":[1700000000,1700000001]},2)
-    assert inserted==2
-    rows=store.history("1HZ100V",10)
-    assert rows[0]["quote_text"]=="1234.50"
-    assert rows[0]["digit"]==0
-    assert rows[1]["digit"]==1
-    assert store.forecasts("1HZ100V")==[]
-```
-
----
-
-## `tests/test_payout_timing.py`
-
-```python
-from bromax.timing import evaluate_payout_timing, _profit_summary
-
-
-def test_no_quote_settlement_pairs_never_selects_duration():
-    report = evaluate_payout_timing([])
-    assert report['best_duration'] is None
-    assert report['execution_authorized'] is False
-    assert report['status'] == 'collecting_quote_backed_settlements'
-
-
-def test_profit_summary_uses_actual_quoted_stake_and_gross_payout():
-    rows = [
-        {'stake': '1', 'payout': '9', 'hit': 1, 'duration_ticks': 1},
-        {'stake': '1', 'payout': '9', 'hit': 0, 'duration_ticks': 1},
-        {'stake': '2', 'payout': '18', 'hit': 1, 'duration_ticks': 1},
-    ]
-    summary = _profit_summary(rows)
-    assert summary['total_stake'] == 4
-    assert summary['total_pnl'] == 23  # +8 -1 +16
-    assert summary['n'] == 3
-
-
-def test_quote_settlement_must_be_exact_duration_epoch():
-    quote = {'event_type':'QUOTE','forecast_seq':1,'duration_ticks':2,'strategy_id':'s',
-             'forecast_epoch':100,'quote_spot_time':'100','stake':'1','payout':'9'}
-    wrong = {'event_type':'SETTLE','forecast_seq':1,'duration_ticks':2,'strategy_id':'s',
-             'forecast_epoch':100,'actual_epoch':103,'hit':1,'stake':'1','payout':'9'}
-    report = evaluate_payout_timing([quote, wrong], min_holdout=1)
-    assert report['best_duration'] is None
-    assert report['status'] == 'collecting_quote_backed_settlements'
-
-
-def test_optimizer_selects_only_quote_backed_profitable_holdout_candidate():
-    events=[]
-    for epoch in range(1,1001):
-        seq=epoch
-        events.append({'event_type':'QUOTE','forecast_seq':seq,'duration_ticks':1,
-                       'strategy_id':'s','strategy_version':'1','forecast_epoch':epoch,
-                       'forecast_tick_id':epoch,'prediction':7,'quote_spot_time':str(epoch),
-                       'stake':'1','payout':'10','proposal_id':f'p{seq}'})
-        hit=int(epoch%4==0)  # 25% wins; 10x gross payout gives positive realized EV.
-        events.append({'event_type':'SETTLE','forecast_seq':seq,'duration_ticks':1,
-                       'strategy_id':'s','strategy_version':'1','forecast_epoch':epoch,
-                       'actual_epoch':epoch+1,'actual_digit':7 if hit else 3,'hit':hit,
-                       'stake':'1','payout':'10','paper_pnl':'9' if hit else '-1'})
-    report=evaluate_payout_timing(events,min_holdout=100)
-    assert report['best_duration']==1
-    assert report['best_candidate']['strategy_id']=='s'
-    assert report['best_candidate']['final_test']['mean_return_ci95'][0] > 0
-    assert report['execution_authorized'] is False
-```
-
----
-
-## `tests/test_research.py`
-
-```python
-import pytest
-from bromax.research import wilson, holm_adjust
-
-def test_wilson_interval_contains_observed_rate():
-    lo,hi=wilson(10,100)
-    assert lo < .10 < hi
-
-def test_holm_adjustment_is_monotone_in_sorted_p_values():
-    adjusted=holm_adjust([.01,.04,.03])
-    assert adjusted[0] <= adjusted[2] <= adjusted[1]
-    assert all(0<=p<=1 for p in adjusted)
-
-
-def test_validation_finalist_is_the_only_strategy_group_opened_on_final_test(monkeypatch):
-    import numpy as np
-    import pandas as pd
-    from bromax.research import PRE_REGISTERED, _forecast_frame, evaluate_symbol
-    monkeypatch.setitem(PRE_REGISTERED["validation_gates"],"minimum_n",100)
-    monkeypatch.setitem(PRE_REGISTERED["validation_gates"],"minimum_quoted_n",100)
-    rng=np.random.default_rng(7); n=6000
-    digits=rng.choice(np.arange(10),n,p=[.30]+[.70/9]*9)
-    ticks=pd.DataFrame({"id":range(1,n+1),"epoch":range(1700000000,1700000000+n),"digit":digits})
-    frame=_forecast_frame(ticks,"SYNTHETIC_TEST_ONLY")
-    quotes=[{"strategy_id":r["strategy_id"],"strategy_version":r["version"],"forecast_tick_id":r["forecast_tick_id"],"prediction":r["prediction"],"probabilities":r["probabilities"],"payout":"8.33","stake":"1.00","actual_digit":r["actual"]} for r in frame.to_dict("records")]
-    report=evaluate_symbol(ticks,"SYNTHETIC_TEST_ONLY",quotes)
-    digit_evidence=report["digit_evidence"]
-    assert len(digit_evidence["digits"])==10
-    assert [row["digit"] for row in digit_evidence["digits"]]==list(range(10))
-    assert all(0<=row["health_score"]<=100 for row in digit_evidence["digits"])
-    assert all(row["decision"]=="DO NOT TRADE" for row in digit_evidence["digits"])
-    assert report["validation_finalists"]
-    assert report["final_test_accessed"] is True
-    assert all(x["final_test"] is None for x in report["strategies"] if x["strategy_id"] not in report["validation_finalists"])
-    assert all(x["final_test"] is not None for x in report["strategies"] if x["strategy_id"] in report["validation_finalists"])
-
-
-def test_verdict_distinguishes_inconclusive_from_no_edge():
-    from bromax.research import _verdict
-    small={"n":100,"payout_adjusted":{"n_with_actual_quote":100,"quote_coverage":1.0}}
-    assert _verdict(small)=="inconclusive"
-    enough={"n":6000,"holm_adjusted_p":.9,"hit_rate_block_bootstrap_ci95":[.05,.09],"payout_adjusted":{"n_with_actual_quote":6000,"quote_coverage":1.0,"realized_profit_ci95":[-.2,-.1]}}
-    assert _verdict(enough)=="no_evidence_of_edge"
-
-
-def test_conditional_transition_candidate_is_preregistered_and_causal():
-    from bromax.strategies import ConditionalTransition, ForecastContext
-    from bromax.research import PRE_REGISTERED, _forecast_frame
-    history=tuple(([1,2,3]*60)+[1,2])
-    f=ConditionalTransition().forecast(ForecastContext("TEST",8,1700000008,history))
-    assert f.strategy_id == "conditional_transition_order2"
-    assert f.prediction == 3
-    assert f.probabilities[3] > f.probabilities[0]
-    assert f.strategy_id in PRE_REGISTERED["candidate_ids"]
-    # Batch replay records the same new candidate without reading the outcome early.
-    import pandas as pd
-    ticks=pd.DataFrame({"id":range(1,1206),"epoch":range(1700000000,1700001205),"digit":[(i%3)+1 for i in range(1205)]})
-    frame=_forecast_frame(ticks,"TEST")
-    assert "conditional_transition_order2" in set(frame.strategy_id)
-    assert frame.tick_index.max() == 1203
-
-
-def test_intelligence_reports_patterns_without_promoting_them():
-    from bromax.intelligence import analyze_ticks
-    rows=[{"digit":[1,2,3][i%3],"quote_text":str(100+i/100),"epoch":1700000000+i} for i in range(120)]
-    result=analyze_ticks(rows,"TEST",120)
-    assert result["patterns"]["conditional_order_2"]["support"] > 0
-    assert result["signal_status"] == "RESEARCH_ONLY_NOT_APPROVED"
-    assert result["market_state"]["absolute_return_observations"] > 0
-
-
-def test_conditional_transition_replay_matches_live_window_context():
-    import numpy as np
-    import pandas as pd
-    from bromax.research import _forecast_frame
-    from bromax.strategies import ConditionalTransition, ForecastContext
-    rng=np.random.default_rng(81)
-    digits=rng.integers(0,10,1400).tolist()
-    ticks=pd.DataFrame({"id":range(1,1401),"epoch":range(1700000000,1700001400),"digit":digits})
-    replay=_forecast_frame(ticks,"TEST")
-    target=replay[(replay.strategy_id=="conditional_transition_order2") & (replay.tick_index==1200)].iloc[0]
-    h=tuple(digits[1200-999:1201])
-    live=ConditionalTransition().forecast(ForecastContext("TEST",1201,1700001200,h))
-    assert list(target.probabilities)==pytest.approx(list(live.probabilities))
-    assert int(target.prediction)==live.prediction
-```
-
----
-
-## `tests/test_storage.py`
-
-```python
-import pytest
-from bromax.storage import Store
-from bromax.strategies import Forecast
-
-def test_audit_log_is_append_only(tmp_path):
-    store=Store(str(tmp_path/"test.db"))
-    from bromax.strategies import Forecast
-    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"x")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    store.append_forecast("1HZ100V",f,tick,100)
-    with store.connect() as c:
-        with pytest.raises(Exception): c.execute("UPDATE audit_events SET note='changed' WHERE seq=1")
-        with pytest.raises(Exception): c.execute("DELETE FROM ticks")
-
-def test_forecast_scores_only_immediate_next_second(tmp_path):
-    store=Store(str(tmp_path/"test.db"))
-    tick1=store.add_tick("1HZ100V",100,"1.20",2,0,"a")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    store.append_forecast("1HZ100V",f,tick1,100)
-    tick_gap=store.add_tick("1HZ100V",102,"1.21",2,1,"b")
-    assert store.score_open_forecasts("1HZ100V",tick_gap,102,1)==[]
-    tick_next=store.add_tick("1HZ100V",101,"1.20",2,0,"c")
-    assert store.score_open_forecasts("1HZ100V",tick_next,101,0)==[(1,1)]
-
-def test_forecast_limit_returns_most_recent_rows_in_chronological_order(tmp_path):
-    store=Store(str(tmp_path/"forecast_limit.db"))
-    for epoch in range(100,104):
-        tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,str(epoch))
-        forecast=Forecast("test","1.0",{},epoch%10,(.1,)*10)
-        store.append_forecast("1HZ100V",forecast,tick,epoch)
-    rows=store.forecasts("1HZ100V",limit=2)
-    assert [row["forecast_epoch"] for row in rows]==[102,103]
-
-
-def test_quote_arriving_after_scoring_is_not_used_as_prediction_time_payout(tmp_path):
-    store=Store(str(tmp_path/"late_quote.db"))
-    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"x")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    seq=store.append_forecast("1HZ100V",f,tick,100)
-    # This quote is captured after the forecast's next-epoch deadline (epoch 101).
-    store.append_quote("1HZ100V",f,seq,8.33,1.00,"late-proposal")
-    assert store.forecasts("1HZ100V")[0]["payout"] is None
-    next_tick=store.add_tick("1HZ100V",101,"1.21",2,1,"y")
-    store.score_open_forecasts("1HZ100V",next_tick,101,1)
-    row=store.forecasts("1HZ100V")[0]
-    assert row["actual_digit"]==1
-    assert row["payout"] is None
-    assert row["stake"] is None
-
-
-def test_subscription_id_is_not_treated_as_unique_tick_id(tmp_path):
-    store=Store(str(tmp_path/"subscription_id.db"))
-    first=store.add_tick("1HZ100V",100,"1.20",2,0,"same-subscription-id")
-    second=store.add_tick("1HZ100V",101,"1.21",2,1,"same-subscription-id")
-    assert first is not None and second is not None and second != first
-
-
-def test_symbol_histories_are_separate(tmp_path):
-    store=Store(str(tmp_path/"symbols.db"))
-    store.add_tick("1HZ100V",100,"1.20",2,0,"sub-a")
-    store.add_tick("1HZ50V",100,"1.27",2,7,"sub-b")
-    assert [r["digit"] for r in store.history("1HZ100V")] == [0]
-    assert [r["digit"] for r in store.history("1HZ50V")] == [7]
-
-def test_quote_before_next_epoch_is_retained(tmp_path):
-    import time
-    store=Store(str(tmp_path/"timely_quote.db"))
-    epoch=int(time.time())+1000
-    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"sub")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    seq=store.append_forecast("1HZ100V",f,tick,epoch)
-    store.append_quote("1HZ100V",f,seq,8.33,1.00,"timely",epoch)
-    nxt=store.add_tick("1HZ100V",epoch+1,"1.21",2,1,"sub")
-    store.score_open_forecasts("1HZ100V",nxt,epoch+1,1)
-    row=store.forecasts("1HZ100V")[0]
-    assert row["actual_digit"]==1
-    assert row["payout"]=="8.33"
-
-
-def test_final_test_snapshot_is_write_once_and_immutable(tmp_path):
-    store=Store(str(tmp_path/"snapshot.db"))
-    assert store.freeze_research_snapshot("1HZ100V",10000,10000,'{"final_test":"first"}') is True
-    assert store.freeze_research_snapshot("1HZ100V",20000,20000,'{"final_test":"second"}') is False
-    assert store.research_snapshot("1HZ100V")["report_json"]=='{"final_test":"first"}'
-    with store.connect() as c:
-        with pytest.raises(Exception): c.execute("UPDATE research_snapshots SET report_json='{}' WHERE symbol='1HZ100V'")
-        with pytest.raises(Exception): c.execute("DELETE FROM research_snapshots WHERE symbol='1HZ100V'")
-
-
-def test_report_uses_frozen_research_snapshot_after_new_data(tmp_path):
-    import json
-    from bromax.research import generate_report
-    store=Store(str(tmp_path/"frozen_report.db"))
-    frozen={"symbol":"1HZ100V","n_ticks":10000,"final_test_accessed":True,"validation_finalists":["rolling_mode_100"],"strategies":[]}
-    store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",10000,10000,json.dumps(frozen))
-    store.add_tick("1HZ100V",9999999999,"1.20",2,0,"subscription")
-    report=generate_report(store,["1HZ100V"])
-    item=report["symbols"][0]
-    assert item["n_ticks"]==10000
-    assert item["research_snapshot"]["frozen"] is True
-
-
-def test_paper_bot_reserves_open_stakes_against_daily_loss_cap(tmp_path):
-    from decimal import Decimal
-    from bromax.paperbot import PaperBot
-    store=Store(str(tmp_path/"risk.db"))
-    bot=PaperBot(store,Decimal("1"),Decimal("1"),Decimal("1.50"),10,approvals_path=tmp_path/"none.json")
-    assert bot.limits_ok("1HZ100V",Decimal("1")) is True
-    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"subscription")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    seq=store.append_forecast("1HZ100V",f,tick,100)
-    store.append_paper_open("1HZ100V",f,seq,tick,100,Decimal("1"),Decimal("8.33"),"p1",100)
-    assert bot.limits_ok("1HZ100V",Decimal("1")) is False
-    assert bot.limits_ok("1HZ50V",Decimal("1")) is False  # global daily risk cap spans symbols
-    assert bot.approved("1HZ100V","test") is False
-
-
-def test_paperbot_requires_user_approval_and_machine_passed_frozen_report(tmp_path, monkeypatch):
-    import json
-    from decimal import Decimal
-    from bromax.paperbot import PaperBot
-    monkeypatch.chdir(tmp_path)
-    (tmp_path/"reports").mkdir()
-    approval=tmp_path/"approved_strategies.json"
-    approval.write_text(json.dumps({"approved":{"1HZ100V":["rolling_mode_500"]}}))
-    test={"n":6000,"holm_adjusted_p":.001,"hit_rate_block_bootstrap_ci95":[.12,.15],"payout_adjusted":{"n_with_actual_quote":6000,"quote_coverage":1.0,"realized_profit_ci95":[.01,.20]}}
-    report={"symbols":[{"symbol":"1HZ100V","research_snapshot":{"frozen":True,"protocol_version":"1.1.0"},"validation_finalists":["rolling_mode_500"],"strategies":[{"strategy_id":"rolling_mode_500","final_test":test,"final_test_verdict":"evidence_of_edge"}]}]}
-    (tmp_path/"reports"/"bromax_report.json").write_text(json.dumps(report))
-    bot=PaperBot(Store(str(tmp_path/"db.sqlite3")),Decimal("1"),Decimal("1"),Decimal("10"),100,approvals_path=approval)
-    assert bot.approved("1HZ100V","rolling_mode_500") is True
-    assert bot.approved("1HZ100V","cumulative_mode") is False
-
-
-def test_settings_reject_unsafe_or_inconsistent_paper_limits():
-    from decimal import Decimal
-    from bromax.config import Settings
-    with pytest.raises(ValueError): Settings(paper_stake=Decimal("2"),max_paper_stake=Decimal("1"))
-    with pytest.raises(ValueError): Settings(min_history_ticks=100)
-
-
-def test_proposal_spot_time_must_match_forecast_epoch(tmp_path):
-    import time
-    store=Store(str(tmp_path/"spot_time.db"))
-    epoch=int(time.time())+1000
-    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"sub")
-    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
-    seq=store.append_forecast("1HZ100V",f,tick,epoch)
-    store.append_quote("1HZ100V",f,seq,8.33,1.00,"mismatched",epoch-1)
-    nxt=store.add_tick("1HZ100V",epoch+1,"1.21",2,1,"sub")
-    store.score_open_forecasts("1HZ100V",nxt,epoch+1,1)
-    assert store.forecasts("1HZ100V")[0]["payout"] is None
-
-
-def test_settings_reject_zero_pending_quote_queue():
-    from bromax.config import Settings
-    with pytest.raises(ValueError): Settings(max_pending_quote_tasks=0)
-
-
-def test_paper_bot_rejects_current_quote_with_nonpositive_model_ev(tmp_path, monkeypatch):
-    from decimal import Decimal
-    from bromax.paperbot import PaperBot
-    from bromax.strategies import Forecast
-    store=Store(str(tmp_path/"ev_gate.db"))
-    bot=PaperBot(store,Decimal("1"),Decimal("1"),Decimal("10"),100,approvals_path=tmp_path/"none.json")
-    bot.approved=lambda symbol,strategy_id: True
-    f=Forecast("test","1.0",{},0,(.10,)+(.10,)*9)
-    assert bot.record("1HZ100V",f,1,1,100,Decimal("1"),Decimal("8"),"p",100)=="current_quote_model_ev_nonpositive"
-
-
-def test_versioned_research_snapshots_preserve_prior_protocols(tmp_path):
-    store=Store(tmp_path/"versioned.sqlite3")
-    assert store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",12000,12000,'{"protocol":"1.1.0"}') is True
-    assert store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",13000,13000,'{"protocol":"changed"}') is False
-    assert store.research_snapshot_versioned("1HZ100V","1.1.0")["report_json"]=='{"protocol":"1.1.0"}'
-    assert store.research_snapshot_versioned("1HZ100V","1.2.0") is None
-    with store.connect() as c:
-        with pytest.raises(Exception):
-            c.execute("UPDATE research_snapshots_v2 SET report_json='{}' WHERE symbol='1HZ100V'")
-
-
-def test_settings_protocol_requires_one_second_symbols():
-    from bromax.config import Settings
-    with pytest.raises(ValueError, match="1HZ"):
-        Settings(symbols=("R_100",))
-
-
-def test_duration_quote_ledger_captures_actual_quote_and_exact_settlement(tmp_path):
-    import time
-    from decimal import Decimal
-    store=Store(str(tmp_path/"duration.sqlite3"))
-    epoch=int(time.time())+1000
-    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"x")
-    f=Forecast("test","1.0",{},2,(0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1))
-    seq=store.append_forecast("1HZ100V",f,tick,epoch)
-    assert store.append_duration_quote("1HZ100V",f,seq,tick,epoch,2,Decimal("1"),Decimal("9"),"proposal",epoch)
-    target=store.add_tick("1HZ100V",epoch+2,"1.23",2,3,"y")
-    settled=store.settle_duration_contracts("1HZ100V",target,epoch+2,3)
-    assert settled[0]["duration_ticks"] == 2
-    assert settled[0]["hit"] == 0
-    assert settled[0]["pnl"] == "-1"
-    assert len(store.duration_events("1HZ100V")) == 2
-    with store.connect() as c:
-        with pytest.raises(Exception): c.execute("UPDATE duration_events SET payout='100' WHERE event_type='QUOTE'")
-```
-
----
-
-## `tests/test_timing.py`
-
-```python
-from bromax.timing import evaluate_timing, wilson
-
-
-def test_wilson_bounds():
-    lo, hi = wilson(10, 100)
-    assert 0 < lo < .1 < hi < 1
-
-
-def test_timing_uses_future_horizon_and_never_authorizes_execution():
-    ticks = [
-        {'id': i+1, 'epoch': 1000+i, 'digit': i % 10, 'quote_text': f'{100+i/100:.2f}', 'symbol': '1HZ100V'}
-        for i in range(80)
-    ]
-    forecasts = [{'event_type':'FORECAST','forecast_tick_id':i+1,'prediction':(i+1)%10,'strategy_id':'test'} for i in range(70)]
-    result = evaluate_timing(ticks, forecasts, durations=(1,2,3))
-    assert result['execution_authorized'] is False
-    assert result['durations_tested_ticks'] == [1,2,3]
-    assert {x['duration_ticks'] for x in result['strategies']} == {1,2,3}
-    assert result['best_duration'] is None
-
-
-def test_missing_epoch_gap_is_not_scored():
-    ticks = [
-        {'id':1,'epoch':100,'digit':1,'quote_text':'1.1'},
-        {'id':2,'epoch':101,'digit':2,'quote_text':'1.2'},
-        {'id':3,'epoch':103,'digit':3,'quote_text':'1.3'},
-        {'id':4,'epoch':104,'digit':4,'quote_text':'1.4'},
-    ]
-    forecasts = [{'forecast_tick_id':1,'prediction':2,'strategy_id':'s'}]
-    result = evaluate_timing(ticks, forecasts, durations=(1,2))
-    rows = {x['duration_ticks']:x for x in result['strategies']}
-    assert rows[1]['n'] == 1
-    assert 2 not in rows
-
-
-def test_volatility_gate_is_fail_closed_without_holdout_evidence():
-    ticks = [
-        {'id': i+1, 'epoch': 2000+i, 'digit': (i*7)%10,
-         'quote_text': f'{100+i/100:.2f}', 'symbol': '1HZ100V'}
-        for i in range(120)
-    ]
-    forecasts = [
-        {'forecast_tick_id': i+1, 'prediction': (i*3)%10, 'strategy_id': 'candidate'}
-        for i in range(100)
-    ]
-    result = evaluate_timing(ticks, forecasts, durations=(1,))
-    assert result['execution_authorized'] is False
-    row = result['strategies'][0]
-    assert all(x['status'] == 'UNCONFIRMED' for x in row['volatility_regimes'])
-```
-
----
 
 ## `docs/API_AND_STATISTICS.md`
 
-````markdown
+```markdown
 # BROMAX technical notes
 
 ## Contract definition
@@ -4341,6 +3974,18 @@ On Windows, `python -m bromax.desktop` opens the synchronized Tkinter panel for 
 
 The previous detailed dashboard is preserved at `GET /advanced`. The floating Windows panel shows only the same recommended digit, probability, health, duration, volatility approval, and paper-only trade status.
 
+### Live market pipeline status and signal history
+
+`GET /health` reports the Deriv WebSocket connection separately from per-symbol subscription and data receipt. Each symbol includes received and processed tick counts, duplicate/invalid/out-of-order counts, observed epoch gaps, last tick and freshness, analysis/strategy/signal-generation state, reconnect count, stored tick/forecast totals, and the most recent processing error. A connected socket is not treated as proof that ticks or forecasts are flowing.
+
+The dashboard displays these pipeline stages and polls `GET /signals/history?symbol=...&limit=10`. That endpoint returns persisted forecasts with strategy, predicted digit, model probability, target epoch, score, and status (`CURRENT`, `SCORED_HIT`, `SCORED_MISS`, or `EXPIRED_UNSCORED`). `CURRENT` is reported only when a forecast uses the latest observed tick and the live feed is fresh. The history is analysis-only; it is not an order request or trading authorization.
+
+The collector uses WebSocket ping/pong, retries network and normal stream closures with bounded exponential backoff, re-seeds historical context, and re-subscribes after reconnecting. Historical backfill may add older records to the append-only database; storage queries sort by market epoch so insertion order cannot corrupt analysis history or latest-tick checks. Seed ticks never create retrospective forecasts. Live epoch gaps are counted, duplicate epochs are ignored, and out-of-order live ticks are dropped. The existing one-second `1HZ` scoring protocol and strategy rules are unchanged.
+
+### Live-execution kill switch foundation
+
+The current release has no live order implementation. `ExecutionInterface` remains disabled, starts with its kill switch engaged, and checks that state before rejecting execution. `POST /safety/kill-switch` engages the process-wide switch and offers no API to clear it; a process restart also starts engaged. This is a fail-closed foundation, not a substitute for testing an actual executor or a broker-side stop. Keep the service bound to localhost unless strong authentication and transport security are configured.
+
 ### Deterministic specialist coordination
 
 `bromax/agents.py` defines typed, deterministic specialists for data quality, statistical strategy research, probability/calibration integrity, market regime, quote-backed contract economics, independent risk approval, and performance monitoring, plus the chief coordinator. These are ordinary Python functions over existing report, quote, tick, and paper-ledger facts—not LLM-generated forecasts. Optional LLM research is disabled and cannot authorize a trade.
@@ -4348,20 +3993,37 @@ The previous detailed dashboard is preserved at `GET /advanced`. The floating Wi
 The risk specialist requires the unchanged existing statistical-finalist and untouched-test checks, a complete ten-digit probability vector, fresh contiguous precision-verified ticks, a passing strategy-specific volatility filter, an unexpired matching proposal, positive recomputed EV, explicit strategy approval, paper-only mode, and per-digit qualification. The chief coordinator also vetoes an inconsistent snapshot. Missing evidence returns `NO TRADE — INSUFFICIENT EVIDENCE`; failed validation returns `REJECTED — FAILED VALIDATION`.
 
 Agent outputs are persisted to the append-only SQLite `agent_runs` ledger. Identical final status and signal snapshots are throttled to one record per symbol per minute; a changed signal identity is recorded immediately. The ledger has update/delete guards. The dashboard and panel render the same endpoint shape; their polling intervals may differ, but each individual display is internally consistent to one snapshot. This endpoint remains paper-only and does not add order execution.
-````
-
----
-
-## `app.py`
-
-```python
-"""ASGI entry point: run with `uvicorn app:app`."""
-from bromax.api import app
-
-__all__ = ["app"]
 ```
 
----
+## `INSTALL_AND_RUN.bat`
+
+```bat
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist .venv\Scripts\python.exe (
+  py -3 -c "import sys; assert sys.version_info >= (3,11), 'Python 3.11 or newer required'"
+  if errorlevel 1 goto error
+  py -3 -m venv .venv
+  if errorlevel 1 goto error
+)
+call .venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+if errorlevel 1 goto error
+pip install -e ".[test]"
+if errorlevel 1 goto error
+if not exist .env copy .env.example .env
+start "BROMAX Server" cmd /k python -m uvicorn app:app --host 127.0.0.1 --port 8765
+timeout /t 3 /nobreak >nul
+start "BROMAX Floating Panel" cmd /k python -m bromax.desktop
+start "" http://127.0.0.1:8765/dashboard
+goto end
+:error
+echo BROMAX setup failed. Review the error above and check Python 3.11+ is installed.
+pause
+:end
+endlocal
+```
 
 ## `pyproject.toml`
 
@@ -4395,34 +4057,6 @@ exclude = ["tests*", "data*", "reports*"]
 bromax = ["dashboard.html", "dashboard_minimal.html"]
 ```
 
----
-
-## `requirements.txt`
-
-```text
-fastapi>=0.115,<1
-uvicorn[standard]>=0.34,<1
-websockets>=15,<17
-numpy>=2,<3
-pandas>=2.2,<4
-scipy>=1.14,<2
-pydantic>=2.9,<3
-python-dotenv>=1,<2
-```
-
----
-
-## `requirements-dev.txt`
-
-```text
--r requirements.txt
-pytest>=8,<10
-pytest-asyncio>=0.24,<2
-httpx>=0.27,<1
-```
-
----
-
 ## `README.md`
 
 ````markdown
@@ -4438,7 +4072,7 @@ BROMAX is one connected application, not two independent predictors. The Deriv c
 
 **No live trading:** this build intentionally contains no API token login, no account authorization, and no `buy`/`sell` request. It is fully runnable in live-feed + read-only-quote + paper-execution mode. Because no strategy has been validated and explicitly approved by default, a fresh installation starts in observation/research mode and does not fabricate trades.
 
-The minimal dashboard and Windows floating panel both consume `GET /decision?symbol=...`. This single deterministic snapshot runs eight specialist roles (including the coordinator), checks that the market tick did not change during evaluation, and exposes a paper signal only when the existing research, probability, quote, volatility, approval, and risk gates all pass. Agent summaries are stored append-only and repeated identical decisions are throttled; an LLM is not needed to calculate probabilities or authorize trades.
+The minimal dashboard and Windows floating panel both consume `GET /decision?symbol=...`. This single deterministic snapshot runs eight specialist roles (including the coordinator), checks that the market tick did not change during evaluation, and exposes a paper signal only when the existing research, probability, quote, volatility, approval, and risk gates all pass. Agent summaries are stored append-only and repeated identical decisions are throttled; an LLM is not needed to calculate probabilities or authorize trades. The primary dashboard also shows connection, subscription, tick-processing, strategy, signal-generation, and persisted forecast-history status separately.
 
 ## 2. What was inspected and changed
 
@@ -4449,7 +4083,7 @@ The available earlier project was `deriv_matches_starter.zip`, containing `app/m
 1. **Precision was only provisional.** The starter `quote_details()` inferred decimal places from the serialized quote string and did not read `tick.pip_size`. It did preserve `Decimal` and did not explicitly strip zeroes, but it could not restore zeroes absent from the JSON number. BROMAX formats each quote to Deriv's `pip_size` precision before extracting the last displayed decimal digit. It never routes quotes through binary floats.
 2. **Database lifecycle.** The starter ran `CREATE TABLE IF NOT EXISTS` on each connection, and its `with sqlite3.connect(...)` usage committed transactions but did not explicitly close the connection. BROMAX initializes the schema once, uses WAL/indexes, and closes each connection through a dedicated context wrapper.
 3. **Single-symbol state.** The starter used one global symbol and an index only on epoch. BROMAX accepts multiple symbols and every history/forecast query is symbol-scoped.
-4. **No deduplication or audit immutability.** The starter had no unique tick key and no append-only triggers. BROMAX deduplicates 1-second ticks by `(symbol, epoch)` (not `tick.id`, which Deriv defines as a per-connection unsubscribe identifier) and prevents updates/deletes to tick, event and frozen-snapshot records.
+4. **No deduplication or audit immutability.** The starter had no unique tick key and no append-only triggers. BROMAX deduplicates 1-second ticks by `(symbol, epoch)` (not `tick.id`, which Deriv defines as a per-connection unsubscribe identifier), rejects out-of-order live ticks, records epoch gaps, and prevents updates/deletes to tick, event and frozen-snapshot records.
 5. **No forecasts or outcome linkage.** BROMAX creates an immutable forecast event before the next tick is processed, then appends a separate score event against the immediately following one-second epoch only. If a tick is missed, the forecast is left unscored; it is never scored against a later tick.
 6. **No strategy versioning.** Every forecast records strategy ID, semantic version, exact parameter JSON, prediction, full 10-digit probability vector, forecast tick ID and timestamp.
 7. **No payout accounting.** BROMAX requests a `DIGITMATCH` proposal for the predicted digit, stake, currency and one-tick duration. The proposal is recorded as a separate append-only quote event, including Deriv’s `spot_time` for audit. Missing quotes are never replaced with assumed payouts; those forecasts cannot contribute to EV or open a paper position.
@@ -4558,14 +4192,16 @@ uvicorn app:app --host 127.0.0.1 --port 8765
 
 The dashboard opens at `http://127.0.0.1:8765/dashboard`; the API docs are at `http://127.0.0.1:8765/docs`. You can also generate a report from the command line with `python -m bromax.cli report`. The CLI default writes the approval report to `reports/bromax_report.json`; the paper bot reads that fixed path.
 
-- `GET /dashboard` — minimal five-section trading decision terminal.
+- `GET /dashboard` — compact trading decision terminal with live pipeline status and persisted signal history.
 - `GET /advanced` — detailed research, strategy, timing, and historical dashboard.
-- `GET /decision?symbol=1HZ100V` — one timestamped response for the dashboard and floating panel, including all ten digit decisions, market freshness, volatility, recorded paper results, and the eight deterministic agent results. It fails closed if the latest tick changes during evaluation.
-- `GET /health` — collector state, per-symbol tick count, last quote, stale-data status and recent errors.
+- `GET /decision?symbol=1HZ100V` — one timestamped response for the dashboard and floating panel, including all ten digit decisions, market freshness, per-symbol collector/analysis pipeline state, volatility, recorded paper results, and the eight deterministic agent results. It fails closed if the latest tick changes during evaluation.
+- `POST /safety/kill-switch` — one-way, process-wide execution stop. It starts engaged, can only be engaged (never cleared through the API), and does not add live execution.
+- `GET /health` — WebSocket and subscription state, per-symbol tick/forecast counts, last quote, data freshness, analysis/strategy/signal-generation state, quality counters, and recent errors.
 - `GET /ticks/latest?symbol=1HZ100V` — latest raw/displayed quotes and digits.
 - `GET /digits/distribution?symbol=1HZ100V&window=1000` — rolling empirical digit frequencies.
 - `GET /intelligence?symbol=1HZ100V&window=1000` — conditional order 1/2/3 recurrence, transition matrix, digit-run length, uniformity diagnostic and descriptive price-volatility metrics.
 - `GET /signals?symbol=1HZ100V` — current candidate forecasts and probability vectors, always marked research-only and never an approval to trade.
+- `GET /signals/history?symbol=1HZ100V&limit=50` — persisted strategy forecasts with prediction probability, target epoch, scored hit/miss, and current/expired status. This read-only analysis history never places an order.
 - `GET /forecasts?symbol=1HZ100V&limit=500` — most recent forecasts, scores and quote metadata (limit 1–5,000).
 - `GET /report` — statistical report.
 - `GET /paper/status` — paper limits and execution state.
@@ -4736,90 +4372,27 @@ The supplied `Dockerfile` is intended for Railway. It listens on Railway's assig
 All dashboard and API endpoints, including API documentation, require those credentials. Use the generated HTTPS domain rather than plain HTTP. Railway hosting and persistent-volume charges may apply. The service remains paper-only and does not add live order placement.
 ````
 
----
+## `requirements-dev.txt`
 
-## `CHANGELOG.md`
-
-````markdown
-## Deterministic multi-agent decision snapshot
-- Added eight typed specialist/coordinator roles that reuse existing research, calibration, volatility, quote, risk, and paper-ledger calculations; no LLM output can generate probabilities or authorize trades.
-- Added `GET /decision` as the synchronized source for the minimal dashboard and Windows floating panel, including same-tick consistency checks and fail-closed signal approval.
-- Added immutable, throttled agent-run persistence and focused tests for data quality, no-trade vetoes, persistence, and snapshot synchronization.
-
-## 2.2.1
-- Changed the local BROMAX web/API listening port from 8000 to 8765 to avoid the previously occupied port. Updated launch command and dashboard URL.
-- Replaced the primary dashboard with a compact five-section decision terminal; retained the detailed dashboard at `/advanced`.
-- Added a fail-closed signal card that requires both the existing READY checks and the stricter per-digit evidence decision.
-- Reduced the always-on-top Windows panel to the same six decision fields and kept polling off the Tkinter UI thread.
-- Added holdout-derived current-regime volatility health and rejection reasons without changing research selection or approval statistics.
-- Added ten-digit research cards, evidence-quality health scores, duration breakdowns, and paper-performance breakdowns to the dashboard and `GET /digits/analysis`.
-- Added a synchronized Windows floating panel with always-on-top and compact modes; the standard launcher opens it with the dashboard.
-- Kept missing model estimates blank and trade decisions fail-closed until per-digit evidence, quote, timing, manual-approval, and paper-risk checks pass.
-- Added focused API, forecast-ordering, and per-digit research coverage; documented the endpoint and panel.
-
-# BROMAX 2.2.0 — 18 November 2026
-
-Earlier 2.1.0 release notes are retained below for traceability.
-
-## Multi-tick timing research
-- Added a dedicated 1–5 tick horizon evaluator that scores frozen forecasts against the digit exactly N observed ticks later. Missing 1-second epochs are excluded rather than silently shifted.
-- Added chronological development (60%), validation (20%), and untouched final-test (20%) splits, Wilson confidence intervals, and Holm multiple-comparison correction across strategy-duration candidates.
-- Reports a research lead only when validation and final-test hit-rate evidence pass minimum-sample and significance gates. This is not an execution approval.
-
-## Volatility diagnostics
-- Added trailing 20-return absolute-volatility measurements and development-trained tercile regimes (LOW/MID/HIGH).
-- Displays regime-specific sample sizes and holdout results alongside timing candidates.
-- Added a fail-closed volatility gate to the READY panel: a one-tick signal is rejected unless the matching strategy and current volatility regime pass minimum-sample, untouched final-test confidence-bound, and Holm-adjusted significance checks. This can intentionally leave the system at NO TRADE until enough evidence exists.
-
-## Safety and limitations
-- Added `GET /timing?symbol=...` and a dashboard timing/volatility research panel.
-- The existing paper executor remains one tick. Multi-tick execution is deliberately not enabled because BROMAX does not yet capture duration-specific quotes or validate payout-adjusted EV for 2–5 tick contracts.
-- Paper-only mode remains; no live order endpoint, authentication, or buy/sell capability was added.
-- No timing can be described as guaranteed or worth risking essential funds on. If evidence is insufficient, the result is no validated timing.
-
-
-## 2.2.0 — 2026-11-18
-- Added live read-only Deriv proposal quote capture for 1–5 tick MATCH durations using batched WebSocket requests.
-- Added append-only duration quote and settlement ledger with exact target-epoch matching.
-- Added actual payout-adjusted realized P/L evaluation, chronological holdouts, HAC confidence intervals, and Holm correction.
-- Added quote-backed profitability panel to the existing new dashboard.
-- Added a fail-closed paper-entry gate requiring confirmed profitability for the exact one-tick executor strategy.
-- Kept live execution disabled; multi-tick durations remain research-only until duration-aware paper execution is built.
-````
-
----
-
-## `INSTALL_AND_RUN.bat`
-
-```bat
-@echo off
-setlocal
-cd /d "%~dp0"
-if not exist .venv\Scripts\python.exe (
-  py -3 -c "import sys; assert sys.version_info >= (3,11), 'Python 3.11 or newer required'"
-  if errorlevel 1 goto error
-  py -3 -m venv .venv
-  if errorlevel 1 goto error
-)
-call .venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-if errorlevel 1 goto error
-pip install -e ".[test]"
-if errorlevel 1 goto error
-if not exist .env copy .env.example .env
-start "BROMAX Server" cmd /k python -m uvicorn app:app --host 127.0.0.1 --port 8765
-timeout /t 3 /nobreak >nul
-start "BROMAX Floating Panel" cmd /k python -m bromax.desktop
-start "" http://127.0.0.1:8765/dashboard
-goto end
-:error
-echo BROMAX setup failed. Review the error above and check Python 3.11+ is installed.
-pause
-:end
-endlocal
+```text
+-r requirements.txt
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
+httpx>=0.27,<1
 ```
 
----
+## `requirements.txt`
+
+```text
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+websockets>=15,<17
+numpy>=2,<3
+pandas>=2.2,<4
+scipy>=1.14,<2
+pydantic>=2.9,<3
+python-dotenv>=1,<2
+```
 
 ## `RUN_TESTS.bat`
 
@@ -4838,86 +4411,1071 @@ pause
 endlocal
 ```
 
----
+## `tests/test_agents.py`
 
-## `.env.example`
+```python
+from datetime import datetime, timedelta, timezone
 
-```text
-DERIV_SYMBOLS=1HZ100V
-DERIV_WS_URL=wss://api.derivws.com/trading/v1/options/ws/public
-DATABASE_PATH=data/bromax.sqlite3
-CURRENCY=USD
-PAPER_STAKE=1.00
-MAX_PAPER_STAKE=1.00
-DAILY_LOSS_CAP=10.00
-MAX_TRADES_PER_DAY=100
-MAX_DATA_AGE_SECONDS=5
-MIN_HISTORY_TICKS=1000
-PROPOSAL_TIMEOUT_SECONDS=4
-MAX_PENDING_QUOTE_TASKS=20
+from bromax.agents import (
+    AgentResult,
+    ChiefIntelligenceCoordinator,
+    DataIntelligenceAgent,
+    PerformanceLearningAgent,
+    ProbabilityCalibrationAgent,
+)
+from bromax.storage import Store
+
+
+def _ticks(count=3):
+    received = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    return [
+        {
+            "id": index + 1,
+            "epoch": 100 + index,
+            "quote_text": f"1.{20 + index:02d}",
+            "pip_size": 2,
+            "digit": index,
+            "received_utc": received,
+        }
+        for index in range(count)
+    ]
+
+
+def test_data_agent_approves_only_fresh_contiguous_precision_checked_ticks():
+    result = DataIntelligenceAgent().run(_ticks(), False, 5)
+    assert result.status == "APPROVED"
+    assert result.metrics["quality_score"] == 100
+
+    malformed = _ticks()
+    malformed[-1]["digit"] = 9
+    result = DataIntelligenceAgent().run(malformed, False, 5)
+    assert result.status == "REJECTED"
+    assert "quote" in result.reasons[0].lower() or "missing tick" in result.reasons[0].lower()
+
+
+def test_data_agent_rejects_stale_feed_even_if_stored_ticks_look_valid():
+    result = DataIntelligenceAgent().run(_ticks(), True, 5)
+    assert result.status == "REJECTED"
+    assert result.metrics["checks"]["fresh"] is False
+
+
+def test_probability_agent_keeps_missing_estimates_missing():
+    analysis = {"digits":[
+        {"digit":digit,"estimated_win_probability":None,"health_percent":None}
+        for digit in range(10)
+    ]}
+    result = ProbabilityCalibrationAgent().run(analysis,{"signals":[]})
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.metrics["valid_digit_estimates"] == 0
+
+
+def test_performance_agent_reports_only_recorded_paper_outcomes():
+    result = PerformanceLearningAgent().run([],[],[])
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.metrics["paper_opened"] == 0
+    assert result.metrics["win_rate"] is None
+    assert result.metrics["net_paper_profit"] is None
+
+
+def test_agent_run_persistence_is_immutable_and_throttled_by_decision(tmp_path):
+    store = Store(str(tmp_path / "agent-runs.sqlite3"))
+    agents = [{"agent_id": "chief_intelligence_coordinator", "status": "INSUFFICIENT_EVIDENCE"}]
+    assert store.record_agent_run("snapshot-1", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
+    assert not store.record_agent_run("snapshot-2", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
+    assert store.record_agent_run("snapshot-3", "1HZ100V", 7, "NO TRADE", "NO TRADE|digit=4", agents)
+    runs = store.agent_runs("1HZ100V")
+    assert [run["snapshot_id"] for run in runs] == ["snapshot-3", "snapshot-1"]
+    assert runs[0]["agent_results"] == agents
+    with store.connect() as connection:
+        try:
+            connection.execute("UPDATE agent_runs SET final_status='TRADE'")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("agent run records must be immutable")
+
+
+def test_coordinator_vetoes_even_an_approved_specialist_result_on_mixed_snapshot():
+    risk = AgentResult(
+        agent_id="risk_signal_approval",
+        status="APPROVED",
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+        duration_ms=1,
+        summary="approved",
+        reasons=(),
+        metrics={},
+        output={"trade_authorized": True, "signal": {"predicted_digit": 2}},
+    )
+    result = ChiefIntelligenceCoordinator().coordinate([], risk, consistent=False)
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.output["trade_authorized"] is False
+    assert result.output["final_status"] == "NO TRADE — INSUFFICIENT EVIDENCE"
 ```
 
----
+## `tests/test_api.py`
 
-## `.gitignore`
+```python
+import pytest
 
-```text
-.venv/
-__pycache__/
-.pytest_cache/
-*.py[cod]
-.env
-data/*.sqlite3
-data/*.sqlite3-shm
-data/*.sqlite3-wal
-reports/*.json
-approved_strategies.json
-*.egg-info/
-data/*
-!data/.gitkeep
-reports/*
-!reports/.gitkeep
+def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path, monkeypatch):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"api.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    paths={route.path for route in api_module.app.routes}
+    assert "/health" in paths
+    assert "/safety/kill-switch" in paths
+    assert "/report" in paths
+    assert "/paper/trades" in paths
+    assert "/signals/history" in paths
+    assert "/intelligence" in paths
+    assert "/signals" in paths
+    assert "/signals/ready" in paths
+    assert "/decision" in paths
+    assert "/timing" in paths
+    assert "/bridge/status" in paths
+    assert "/dashboard" in paths
+    assert "/advanced" in paths
+    assert "/digits/analysis" in paths
+    assert not any("buy" in path.lower() or "live" in path.lower() for path in paths)
+    assert api_module.paper_status()["mode"]=="SIMULATED_ONLY"
+    assert api_module.execution_interface.kill_switch_engaged is True
+    switch=api_module.engage_execution_kill_switch()
+    assert switch["status"]=="KILL_SWITCH_ENGAGED"
+    assert switch["live_execution_implemented"] is False
+    assert switch["live_execution_enabled"] is False
+    bridge=api_module.bridge_status()
+    assert bridge["execution"]=="paper_only_no_buy_endpoint"
+    assert bridge["mode"]=="SIMULATED_ONLY"
+    page=api_module.dashboard()
+    assert "BROMAX" in page
+    assert "Best trading signal" in page
+    assert "NO QUALIFIED SIGNAL" in page
+    assert "Digit prediction" in page
+    assert "Live analysis pipeline" in page
+    assert "signalHistory" in page
+    assert page.count("<section ")==6
+    assert "/decision?symbol=" in page
+    assert "/digits/analysis?symbol=" not in page
+    assert "Timing & volatility research" not in page
+    advanced=api_module.advanced_dashboard()
+    assert "Ready to trade" in advanced
+    assert 'href="/dashboard"' in advanced
+    ready=api_module.ready_signal("1HZ100V")
+    assert ready["eligible"] is False
+    assert ready["status"] == "WAITING"
+    health=api_module.health()
+    assert health["pipeline"]["1HZ100V"]["connection_status"]=="DISCONNECTED"
+    signal_history=api_module.signal_history("1HZ100V")
+    assert signal_history["trade_authorized"] is False
+    assert signal_history["signals"]==[]
+    assert api_module.intelligence("1HZ100V",100)["signal_status"]=="RESEARCH_ONLY_NOT_APPROVED"
+    assert api_module.signals("1HZ100V")["trade_authorized"] is False
+    timing = api_module.timing_research("1HZ100V")
+    assert timing["execution_authorized"] is False
+    assert timing["durations_tested_ticks"] == [1, 2, 3, 4, 5]
+    assert "payout_optimization" in timing
+    assert timing["payout_optimization"]["execution_authorized"] is False
+
+
+def test_unified_decision_returns_one_persisted_no_trade_snapshot(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"decision.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{}}]})
+    monkeypatch.setattr(api_module,"digit_analysis",lambda symbol:{
+        "latest_tick":None,"volatility_filter":{"status":"INSUFFICIENT DATA"},
+        "digits":[{"digit":digit,"estimated_win_probability":None,"health_percent":None,
+                   "decision":"DO NOT TRADE","reasons":["Insufficient validated evidence."]}
+                  for digit in range(10)],
+    })
+    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[],"trade_authorized":False})
+    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[]})
+    monkeypatch.setattr(api_module,"ready_signal",lambda symbol:{
+        "symbol":symbol,"status":"WAITING","eligible":False,"signal":None,
+        "reason":"No statistically approved quote-backed signal.",
+    })
+
+    first=api_module.unified_decision("1HZ100V")
+    second=api_module.unified_decision("1HZ100V")
+    assert first["trade_authorized"] is False
+    assert first["final_status"]=="NO TRADE — INSUFFICIENT EVIDENCE"
+    assert len(first["digits"])==10
+    assert len(first["agents"])==8
+    assert first["agent_run_persisted"] is True
+    assert second["agent_run_persisted"] is False
+    assert len(api_module.store.agent_runs("1HZ100V"))==1
+    assert {agent["evaluated_at"] for agent in first["agents"]}=={first["created_at"]}
+
+def test_digit_analysis_returns_all_digits_without_inventing_estimates(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"digit-analysis.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{"selected_strategy_id":None,"digits":[]}}]})
+    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[]})
+    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[],"payout_optimization":{}})
+    result=api_module.digit_analysis("1HZ100V")
+    assert [row["digit"] for row in result["digits"]]==list(range(10))
+    assert result["trade_authorized"] is False
+    assert all(row["estimated_win_probability"] is None for row in result["digits"])
+    assert all(row["health_percent"] is None for row in result["digits"])
+    assert all(row["decision"]=="DO NOT TRADE" for row in result["digits"])
+    assert result["volatility_filter"]["health_percent"] is None
+
+
+def test_signal_history_marks_current_and_expired_persisted_forecasts(monkeypatch,tmp_path):
+    import importlib
+    import time
+    from bromax.strategies import Forecast
+
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"signal-history.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    monkeypatch.setenv("MAX_DATA_AGE_SECONDS","5")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    tick_id=api_module.store.add_tick("1HZ100V",1700000000,"1234.56",2,6)
+    forecast=Forecast("history-test","test",{},3,(.1,.1,.1,.4,.1,.05,.05,.05,.025,.025))
+    api_module.store.append_forecast("1HZ100V",forecast,tick_id,1700000000)
+    api_module.collector.last_received["1HZ100V"]=time.time()
+
+    result=api_module.signal_history("1HZ100V")
+    assert result["trade_authorized"] is False
+    assert result["signals"][0]["prediction"]==3
+    assert result["signals"][0]["confidence"]==.4
+    assert result["signals"][0]["target_epoch"]==1700000001
+    assert result["signals"][0]["status"]=="CURRENT"
+
+    api_module.collector.last_received["1HZ100V"]=time.time()-10
+    expired=api_module.signal_history("1HZ100V")
+    assert expired["signals"][0]["status"]=="EXPIRED_UNSCORED"
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_endpoint_engages_and_never_enables_live_execution(monkeypatch, tmp_path):
+    import importlib
+    import httpx
+
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"kill-switch.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    transport=httpx.ASGITransport(app=api_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url="http://test") as client:
+        response=await client.post("/safety/kill-switch")
+    assert response.status_code==200
+    result=response.json()
+    assert result["kill_switch_engaged"] is True
+    assert result["live_execution_implemented"] is False
+    assert result["live_execution_enabled"] is False
+
+
+def test_volatility_health_uses_observed_holdout_checks(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"volatility-health.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{"selected_strategy_id":"candidate","digits":[]}}]})
+    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[{
+        "strategy_id":"candidate","version":"1.0","predicted_digit":0,
+        "predicted_digit_probability":.1,"probabilities":[.1]*10,
+    }]})
+    holdout={"n":1000,"hit_rate_ci95":[.11,.14],"holm_adjusted_p":.01}
+    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{
+        "current_volatility_regime":"LOW",
+        "strategies":[{"strategy_id":"candidate","duration_ticks":1,"volatility_regimes":[
+            {"regime":"LOW","status":"CONFIRMED_FOR_THIS_STRATEGY_AND_HORIZON","validation":holdout,"final_test":holdout}
+        ]}],
+        "payout_optimization":{},
+    })
+    result=api_module.digit_analysis("1HZ100V")
+    assert result["volatility_filter"]["status"]=="PASS"
+    assert result["volatility_filter"]["health_percent"]==100
+    assert result["volatility_filter"]["checks_passed"]==6
+
+@pytest.mark.asyncio
+async def test_cloud_basic_auth_protects_dashboard_and_api(monkeypatch, tmp_path):
+    import base64
+    import importlib
+    import httpx
+
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"protected.sqlite3"))
+    monkeypatch.setenv("BROMAX_REQUIRE_AUTH","true")
+    monkeypatch.setenv("BROMAX_AUTH_USERNAME","viewer")
+    monkeypatch.setenv("BROMAX_AUTH_PASSWORD","test-password")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    transport=httpx.ASGITransport(app=api_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url="http://test") as client:
+        denied=await client.get("/dashboard")
+        assert denied.status_code==401
+        assert "Basic" in denied.headers["www-authenticate"]
+        credentials=base64.b64encode(b"viewer:test-password").decode("ascii")
+        allowed=await client.get("/dashboard",headers={"Authorization":f"Basic {credentials}"})
+        assert allowed.status_code==200
 ```
 
----
+## `tests/test_collector.py`
 
-## `.dockerignore`
+```python
+import asyncio
+import json
+import time
+from decimal import Decimal
 
-```text
-.venv
-__pycache__
-.pytest_cache
-*.py[cod]
-*.egg-info
-.env
-.git
-data
-reports
-approved_strategies.json
+import pytest
+
+from bromax.collector import MarketCollector
+from bromax.config import Settings
+from bromax.storage import Store
+
+
+def _collector(tmp_path):
+    settings=Settings(database_path=str(tmp_path/"collector.sqlite3"))
+    store=Store(settings.database_path)
+    return MarketCollector(settings,store),store
+
+
+@pytest.mark.asyncio
+async def test_live_shaped_tick_runs_existing_strategies_and_persists_forecasts(tmp_path):
+    collector,store=_collector(tmp_path)
+    start_epoch=1_700_000_000
+    prices=[Decimal(f"1234.{index%100:02d}") for index in range(999)]
+    times=list(range(start_epoch,start_epoch+len(prices)))
+    assert collector._seed_history(
+        "1HZ100V",{"prices":prices,"times":times},2
+    )==999
+
+    async def no_quotes(*_args):
+        return None
+
+    collector._capture_quotes=no_quotes
+    tick={
+        "symbol":"1HZ100V",
+        "epoch":start_epoch+len(prices),
+        "quote":Decimal("1234.56"),
+        "pip_size":2,
+        "id":"subscription-tick-1",
+    }
+    assert await collector._handle_tick(tick) is True
+    await asyncio.sleep(0)
+
+    rows=store.forecasts("1HZ100V")
+    state=collector.operational_status("1HZ100V")
+    assert len(rows)==len(collector.strategies)
+    assert {row["strategy_id"] for row in rows}=={strategy.strategy_id for strategy in collector.strategies}
+    assert {row["forecast_epoch"] for row in rows}=={tick["epoch"]}
+    assert state["received_ticks"]==state["processed_ticks"]==1
+    assert state["analysis_status"]=="ANALYZED"
+    assert state["strategy_status"]=="PROCESSED"
+    assert state["signal_generation_status"]=="GENERATED"
+    assert state["signals_generated"]==len(rows)
+    assert store.paper_events()==[]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_invalid_and_out_of_order_ticks_are_counted_and_dropped(tmp_path):
+    collector,store=_collector(tmp_path)
+    epoch=1_700_000_000
+    store.add_tick("1HZ100V",epoch,"1234.50",2,0)
+    tick={"symbol":"1HZ100V","epoch":epoch,"quote":Decimal("1234.50"),"pip_size":2}
+
+    assert await collector._handle_tick(tick) is False
+    assert await collector._handle_tick({**tick,"epoch":epoch-1}) is False
+    with pytest.raises(ValueError,match="missing quote"):
+        await collector._handle_tick({"symbol":"1HZ100V","epoch":epoch+1,"pip_size":2})
+
+    state=collector.operational_status("1HZ100V")
+    assert state["duplicate_ticks"]==1
+    assert state["out_of_order_ticks"]==1
+    assert state["invalid_ticks"]==1
+    assert len(store.history("1HZ100V"))==1
+
+
+def test_historical_seed_backfills_missing_epochs_and_reads_chronologically(tmp_path):
+    collector,store=_collector(tmp_path)
+    prices=[Decimal("1.11"),Decimal("1.12"),Decimal("1.13")]
+    assert collector._seed_history(
+        "1HZ100V",{"prices":prices,"times":[1700000003,1700000001,1700000002]},2
+    )==3
+    assert [row["epoch"] for row in store.history("1HZ100V")]==[1700000001,1700000002,1700000003]
+    assert collector._seed_history(
+        "1HZ100V",
+        {"prices":[Decimal("1.10"),Decimal("1.14")],"times":[1700000000,1700000004]},
+        2,
+    )==2
+    assert [row["epoch"] for row in store.history("1HZ100V")]==[
+        1700000000,1700000001,1700000002,1700000003,1700000004
+    ]
+
+
+def test_stale_feed_is_distinguished_from_connected_or_receiving_data(tmp_path):
+    collector,_store=_collector(tmp_path)
+    collector._set_connection_status("CONNECTED")
+    state=collector.operational_status("1HZ100V")
+    assert state["data_status"]=="NO DATA"
+    assert state["pipeline_status"]=="CONNECTED"
+
+    collector.last_received["1HZ100V"]=time.time()-10
+    state=collector.operational_status("1HZ100V")
+    assert state["data_status"]=="STALE"
+    assert state["pipeline_status"]=="STALE DATA"
+
+
+@pytest.mark.asyncio
+async def test_normal_stream_close_reconnects_and_restores_subscription(monkeypatch,tmp_path):
+    import bromax.collector as collector_module
+
+    collector,store=_collector(tmp_path)
+    second_subscription=asyncio.Event()
+    connection_count=0
+    subscription_count=0
+
+    class FakeSocket:
+        def __init__(self,index):
+            self.index=index
+            self.history_req_id=None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self,*_args):
+            return None
+
+        async def send(self,raw):
+            nonlocal subscription_count
+            request=json.loads(raw)
+            if "ticks_history" in request:
+                self.history_req_id=request["req_id"]
+            if request.get("subscribe"):
+                subscription_count+=1
+                if subscription_count==2:
+                    second_subscription.set()
+
+        async def recv(self):
+            return json.dumps({
+                "req_id":self.history_req_id,
+                "history":{"prices":[],"times":[]},
+                "pip_size":2,
+            })
+
+        def __aiter__(self):
+            async def messages():
+                if self.index==1:
+                    yield json.dumps({
+                        "msg_type":"tick",
+                        "tick":{"symbol":"1HZ100V","epoch":1700000000,"quote":1234.56,"pip_size":2},
+                    })
+                else:
+                    await asyncio.Event().wait()
+            return messages()
+
+    def fake_connect(*_args,**_kwargs):
+        nonlocal connection_count
+        connection_count+=1
+        return FakeSocket(connection_count)
+
+    monkeypatch.setattr(collector_module.websockets,"connect",fake_connect)
+    task=asyncio.create_task(collector.run_forever())
+    try:
+        await asyncio.wait_for(second_subscription.wait(),timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert connection_count==2
+    assert subscription_count==2
+    assert collector.reconnect_count>=1
+    assert collector.connection_status=="DISCONNECTED"
+    assert collector.errors==[]
+    assert collector.operational_status("1HZ100V")["received_ticks"]==1
+    assert len(store.history("1HZ100V"))==1
 ```
 
----
+## `tests/test_digits.py`
 
-## `Dockerfile`
+```python
+from decimal import Decimal
+import pytest
+from bromax.digits import extract_last_digit, quote_precision, QuotePrecisionError
 
-```text
-FROM python:3.12-slim
+@pytest.mark.parametrize("symbol,quote,pip_size,expected_text,expected_digit",[
+    ("1HZ100V","1234.50",2,"1234.50",0),
+    ("1HZ100V",Decimal("1234.5"),2,"1234.50",0),
+    ("1HZ100V","1234.56",2,"1234.56",6),
+    ("1HZ15V","987.1",3,"987.100",0),
+    ("R_100","987.123",3,"987.123",3),
+    ("R_50","100.00",2,"100.00",0),
+    ("R_10","42",2,"42.00",0),
+])
+def test_last_displayed_digit_by_symbol_precision(symbol,quote,pip_size,expected_text,expected_digit):
+    assert extract_last_digit(quote,pip_size)==(expected_text,expected_digit)
 
-WORKDIR /app
+def test_zero_decimal_precision_has_no_decimal_digit():
+    assert extract_last_digit("1234",0)==("1234",None)
 
-COPY pyproject.toml ./
-COPY app.py ./
-COPY bromax ./bromax
+def test_rejects_nonzero_excess_precision():
+    with pytest.raises(QuotePrecisionError): extract_last_digit("1.234",2)
 
-RUN pip install --no-cache-dir . \
-    && mkdir -p /data
+def test_rejects_bad_precision():
+    with pytest.raises(QuotePrecisionError): quote_precision("2.5")
 
-ENV DATABASE_PATH=/data/bromax.sqlite3 \
-    BROMAX_REQUIRE_AUTH=true
 
-EXPOSE 8765
-
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8765}"]
+def test_binary_float_quotes_are_rejected():
+    with pytest.raises(QuotePrecisionError): extract_last_digit(1234.5,2)
 ```
 
----
+## `tests/test_leakage.py`
+
+```python
+import pytest
+from bromax.strategies import ForecastContext, candidate_strategies
+
+def test_forecast_context_contains_only_observed_history():
+    ctx=ForecastContext("1HZ100V",101,1700000000,(1,2,3,4))
+    assert ctx.history==(1,2,3,4)
+    assert not hasattr(ctx,"next_tick_digit")
+    assert not hasattr(ctx,"actual_next_digit")
+
+class DeliberatePeek:
+    strategy_id="deliberate_peek"
+    version="test"
+    parameters={}
+    def forecast(self,context):
+        # This must fail: no future outcome is supplied to the forecasting interface.
+        return context.next_tick_digit
+
+def test_deliberate_lookahead_attempt_fails():
+    ctx=ForecastContext("1HZ100V",101,1700000000,(1,2,3,4))
+    with pytest.raises(AttributeError): DeliberatePeek().forecast(ctx)
+
+def test_candidate_forecasts_are_valid_and_use_only_context():
+    ctx=ForecastContext("1HZ100V",101,1700000000,tuple([i%10 for i in range(100)]))
+    for strategy in candidate_strategies():
+        forecast=strategy.forecast(ctx)
+        assert 0 <= forecast.prediction <= 9
+        assert len(forecast.probabilities)==10
+        assert sum(forecast.probabilities)==pytest.approx(1.0)
+
+
+def test_execution_interface_is_disabled_and_raises():
+    import asyncio
+    from bromax.paperbot import ExecutionInterface
+    interface=ExecutionInterface()
+    assert interface.enabled is False
+    assert interface.kill_switch_engaged is True
+    with pytest.raises(RuntimeError,match="kill switch"):
+        asyncio.run(interface.execute())
+    interface.engage_kill_switch()
+    assert interface.kill_switch_engaged is True
+    with pytest.raises(RuntimeError,match="kill switch"):
+        asyncio.run(interface.execute())
+
+
+def test_batch_backtest_matches_online_strategy_definitions():
+    import pandas as pd
+    from bromax.research import _forecast_frame
+    from bromax.strategies import candidate_strategies, ForecastContext
+    digits=[(i*7+3)%10 for i in range(1200)]
+    ticks=pd.DataFrame({"id":range(1,1201),"epoch":range(1700000000,1700001200),"digit":digits})
+    frame=_forecast_frame(ticks,"1HZ100V")
+    row=frame[(frame.tick_index==1099)&(frame.strategy_id=="exp_frequency_hl50")].iloc[0]
+    ctx=ForecastContext("1HZ100V",1100,1700001099,tuple(digits[100:1100]),tuple(__import__("numpy").bincount(digits[:1100],minlength=10)))
+    online=next(s for s in candidate_strategies() if s.strategy_id=="exp_frequency_hl50").forecast(ctx)
+    assert int(row.prediction)==online.prediction
+    assert list(row.probabilities)==pytest.approx(list(online.probabilities))
+
+
+def test_cumulative_mode_uses_only_past_count_summary():
+    import numpy as np
+    from bromax.strategies import CumulativeMode
+    counts=tuple(np.bincount([1,1,2,2,2],minlength=10))
+    ctx=ForecastContext("1HZ100V",5,1004,(1,1,2,2,2),counts)
+    assert CumulativeMode().forecast(ctx).prediction==2
+
+
+def test_proposal_amount_is_encoded_as_exact_json_decimal():
+    import json
+    from decimal import Decimal
+    from bromax.proposals import encode_proposal_request
+    raw=encode_proposal_request("1HZ100V",3,Decimal("1.20"),"USD",1,99)
+    assert '"amount": 1.20' in raw
+    assert json.loads(raw)["amount"]==1.2
+
+
+def test_changing_future_digit_cannot_change_forecast_at_prior_tick():
+    import pandas as pd
+    from bromax.research import _forecast_frame
+    digits=[(i*3+7)%10 for i in range(1100)]
+    first=pd.DataFrame({"id":range(1,1101),"epoch":range(1700000000,1700001100),"digit":digits})
+    changed=digits.copy(); changed[1000]=(changed[1000]+1)%10
+    second=first.copy(); second["digit"]=changed
+    a=_forecast_frame(first,"1HZ100V")
+    b=_forecast_frame(second,"1HZ100V")
+    ra=a[a.tick_index==999].sort_values("strategy_id")
+    rb=b[b.tick_index==999].sort_values("strategy_id")
+    assert ra.prediction.tolist()==rb.prediction.tolist()
+    assert list(ra.probabilities)==list(rb.probabilities)
+
+
+def test_cumulative_mode_batch_prediction_matches_live_context():
+    import pandas as pd
+    import numpy as np
+    from bromax.research import _forecast_frame
+    from bromax.strategies import CumulativeMode, ForecastContext
+    digits=[(i*11+5)%10 for i in range(1200)]
+    ticks=pd.DataFrame({"id":range(1,1201),"epoch":range(1700000000,1700001200),"digit":digits})
+    frame=_forecast_frame(ticks,"1HZ100V")
+    row=frame[(frame.tick_index==1099)&(frame.strategy_id=="cumulative_mode")].iloc[0]
+    ctx=ForecastContext("1HZ100V",1100,1700001099,tuple(digits[100:1100]),tuple(np.bincount(digits[:1100],minlength=10)))
+    live=CumulativeMode().forecast(ctx)
+    assert int(row.prediction)==live.prediction
+    assert list(row.probabilities)==pytest.approx(list(live.probabilities))
+
+
+def test_proposal_request_rejects_binary_float_stake():
+    from bromax.proposals import encode_proposal_request
+    with pytest.raises(ValueError): encode_proposal_request("1HZ100V",3,1.2,"USD",1,100)
+
+
+def test_historical_seed_uses_pip_size_and_never_creates_forecasts(tmp_path):
+    from bromax.collector import MarketCollector
+    from bromax.config import Settings
+    from bromax.storage import Store
+    from decimal import Decimal
+    store=Store(tmp_path/"seed.sqlite3")
+    settings=Settings(database_path=str(tmp_path/"seed.sqlite3"),min_history_ticks=1000)
+    collector=MarketCollector(settings,store)
+    inserted=collector._seed_history("1HZ100V",{"prices":[Decimal("1234.5"),Decimal("1234.51")],"times":[1700000000,1700000001]},2)
+    assert inserted==2
+    rows=store.history("1HZ100V",10)
+    assert rows[0]["quote_text"]=="1234.50"
+    assert rows[0]["digit"]==0
+    assert rows[1]["digit"]==1
+    assert store.forecasts("1HZ100V")==[]
+```
+
+## `tests/test_payout_timing.py`
+
+```python
+from bromax.timing import evaluate_payout_timing, _profit_summary
+
+
+def test_no_quote_settlement_pairs_never_selects_duration():
+    report = evaluate_payout_timing([])
+    assert report['best_duration'] is None
+    assert report['execution_authorized'] is False
+    assert report['status'] == 'collecting_quote_backed_settlements'
+
+
+def test_profit_summary_uses_actual_quoted_stake_and_gross_payout():
+    rows = [
+        {'stake': '1', 'payout': '9', 'hit': 1, 'duration_ticks': 1},
+        {'stake': '1', 'payout': '9', 'hit': 0, 'duration_ticks': 1},
+        {'stake': '2', 'payout': '18', 'hit': 1, 'duration_ticks': 1},
+    ]
+    summary = _profit_summary(rows)
+    assert summary['total_stake'] == 4
+    assert summary['total_pnl'] == 23  # +8 -1 +16
+    assert summary['n'] == 3
+
+
+def test_quote_settlement_must_be_exact_duration_epoch():
+    quote = {'event_type':'QUOTE','forecast_seq':1,'duration_ticks':2,'strategy_id':'s',
+             'forecast_epoch':100,'quote_spot_time':'100','stake':'1','payout':'9'}
+    wrong = {'event_type':'SETTLE','forecast_seq':1,'duration_ticks':2,'strategy_id':'s',
+             'forecast_epoch':100,'actual_epoch':103,'hit':1,'stake':'1','payout':'9'}
+    report = evaluate_payout_timing([quote, wrong], min_holdout=1)
+    assert report['best_duration'] is None
+    assert report['status'] == 'collecting_quote_backed_settlements'
+
+
+def test_optimizer_selects_only_quote_backed_profitable_holdout_candidate():
+    events=[]
+    for epoch in range(1,1001):
+        seq=epoch
+        events.append({'event_type':'QUOTE','forecast_seq':seq,'duration_ticks':1,
+                       'strategy_id':'s','strategy_version':'1','forecast_epoch':epoch,
+                       'forecast_tick_id':epoch,'prediction':7,'quote_spot_time':str(epoch),
+                       'stake':'1','payout':'10','proposal_id':f'p{seq}'})
+        hit=int(epoch%4==0)  # 25% wins; 10x gross payout gives positive realized EV.
+        events.append({'event_type':'SETTLE','forecast_seq':seq,'duration_ticks':1,
+                       'strategy_id':'s','strategy_version':'1','forecast_epoch':epoch,
+                       'actual_epoch':epoch+1,'actual_digit':7 if hit else 3,'hit':hit,
+                       'stake':'1','payout':'10','paper_pnl':'9' if hit else '-1'})
+    report=evaluate_payout_timing(events,min_holdout=100)
+    assert report['best_duration']==1
+    assert report['best_candidate']['strategy_id']=='s'
+    assert report['best_candidate']['final_test']['mean_return_ci95'][0] > 0
+    assert report['execution_authorized'] is False
+```
+
+## `tests/test_research.py`
+
+```python
+import pytest
+from bromax.research import wilson, holm_adjust
+
+def test_wilson_interval_contains_observed_rate():
+    lo,hi=wilson(10,100)
+    assert lo < .10 < hi
+
+def test_holm_adjustment_is_monotone_in_sorted_p_values():
+    adjusted=holm_adjust([.01,.04,.03])
+    assert adjusted[0] <= adjusted[2] <= adjusted[1]
+    assert all(0<=p<=1 for p in adjusted)
+
+
+def test_validation_finalist_is_the_only_strategy_group_opened_on_final_test(monkeypatch):
+    import numpy as np
+    import pandas as pd
+    from bromax.research import PRE_REGISTERED, _forecast_frame, evaluate_symbol
+    monkeypatch.setitem(PRE_REGISTERED["validation_gates"],"minimum_n",100)
+    monkeypatch.setitem(PRE_REGISTERED["validation_gates"],"minimum_quoted_n",100)
+    rng=np.random.default_rng(7); n=6000
+    digits=rng.choice(np.arange(10),n,p=[.30]+[.70/9]*9)
+    ticks=pd.DataFrame({"id":range(1,n+1),"epoch":range(1700000000,1700000000+n),"digit":digits})
+    frame=_forecast_frame(ticks,"SYNTHETIC_TEST_ONLY")
+    quotes=[{"strategy_id":r["strategy_id"],"strategy_version":r["version"],"forecast_tick_id":r["forecast_tick_id"],"prediction":r["prediction"],"probabilities":r["probabilities"],"payout":"8.33","stake":"1.00","actual_digit":r["actual"]} for r in frame.to_dict("records")]
+    report=evaluate_symbol(ticks,"SYNTHETIC_TEST_ONLY",quotes)
+    digit_evidence=report["digit_evidence"]
+    assert len(digit_evidence["digits"])==10
+    assert [row["digit"] for row in digit_evidence["digits"]]==list(range(10))
+    assert all(0<=row["health_score"]<=100 for row in digit_evidence["digits"])
+    assert all(row["decision"]=="DO NOT TRADE" for row in digit_evidence["digits"])
+    assert report["validation_finalists"]
+    assert report["final_test_accessed"] is True
+    assert all(x["final_test"] is None for x in report["strategies"] if x["strategy_id"] not in report["validation_finalists"])
+    assert all(x["final_test"] is not None for x in report["strategies"] if x["strategy_id"] in report["validation_finalists"])
+
+
+def test_verdict_distinguishes_inconclusive_from_no_edge():
+    from bromax.research import _verdict
+    small={"n":100,"payout_adjusted":{"n_with_actual_quote":100,"quote_coverage":1.0}}
+    assert _verdict(small)=="inconclusive"
+    enough={"n":6000,"holm_adjusted_p":.9,"hit_rate_block_bootstrap_ci95":[.05,.09],"payout_adjusted":{"n_with_actual_quote":6000,"quote_coverage":1.0,"realized_profit_ci95":[-.2,-.1]}}
+    assert _verdict(enough)=="no_evidence_of_edge"
+
+
+def test_conditional_transition_candidate_is_preregistered_and_causal():
+    from bromax.strategies import ConditionalTransition, ForecastContext
+    from bromax.research import PRE_REGISTERED, _forecast_frame
+    history=tuple(([1,2,3]*60)+[1,2])
+    f=ConditionalTransition().forecast(ForecastContext("TEST",8,1700000008,history))
+    assert f.strategy_id == "conditional_transition_order2"
+    assert f.prediction == 3
+    assert f.probabilities[3] > f.probabilities[0]
+    assert f.strategy_id in PRE_REGISTERED["candidate_ids"]
+    # Batch replay records the same new candidate without reading the outcome early.
+    import pandas as pd
+    ticks=pd.DataFrame({"id":range(1,1206),"epoch":range(1700000000,1700001205),"digit":[(i%3)+1 for i in range(1205)]})
+    frame=_forecast_frame(ticks,"TEST")
+    assert "conditional_transition_order2" in set(frame.strategy_id)
+    assert frame.tick_index.max() == 1203
+
+
+def test_intelligence_reports_patterns_without_promoting_them():
+    from bromax.intelligence import analyze_ticks
+    rows=[{"digit":[1,2,3][i%3],"quote_text":str(100+i/100),"epoch":1700000000+i} for i in range(120)]
+    result=analyze_ticks(rows,"TEST",120)
+    assert result["patterns"]["conditional_order_2"]["support"] > 0
+    assert result["signal_status"] == "RESEARCH_ONLY_NOT_APPROVED"
+    assert result["market_state"]["absolute_return_observations"] > 0
+
+
+def test_conditional_transition_replay_matches_live_window_context():
+    import numpy as np
+    import pandas as pd
+    from bromax.research import _forecast_frame
+    from bromax.strategies import ConditionalTransition, ForecastContext
+    rng=np.random.default_rng(81)
+    digits=rng.integers(0,10,1400).tolist()
+    ticks=pd.DataFrame({"id":range(1,1401),"epoch":range(1700000000,1700001400),"digit":digits})
+    replay=_forecast_frame(ticks,"TEST")
+    target=replay[(replay.strategy_id=="conditional_transition_order2") & (replay.tick_index==1200)].iloc[0]
+    h=tuple(digits[1200-999:1201])
+    live=ConditionalTransition().forecast(ForecastContext("TEST",1201,1700001200,h))
+    assert list(target.probabilities)==pytest.approx(list(live.probabilities))
+    assert int(target.prediction)==live.prediction
+```
+
+## `tests/test_storage.py`
+
+```python
+import pytest
+from bromax.storage import Store
+from bromax.strategies import Forecast
+
+def test_audit_log_is_append_only(tmp_path):
+    store=Store(str(tmp_path/"test.db"))
+    from bromax.strategies import Forecast
+    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"x")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    store.append_forecast("1HZ100V",f,tick,100)
+    with store.connect() as c:
+        with pytest.raises(Exception): c.execute("UPDATE audit_events SET note='changed' WHERE seq=1")
+        with pytest.raises(Exception): c.execute("DELETE FROM ticks")
+
+def test_forecast_scores_only_immediate_next_second(tmp_path):
+    store=Store(str(tmp_path/"test.db"))
+    tick1=store.add_tick("1HZ100V",100,"1.20",2,0,"a")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    store.append_forecast("1HZ100V",f,tick1,100)
+    tick_gap=store.add_tick("1HZ100V",102,"1.21",2,1,"b")
+    assert store.score_open_forecasts("1HZ100V",tick_gap,102,1)==[]
+    tick_next=store.add_tick("1HZ100V",101,"1.20",2,0,"c")
+    assert store.score_open_forecasts("1HZ100V",tick_next,101,0)==[(1,1)]
+
+def test_forecast_limit_returns_most_recent_rows_in_chronological_order(tmp_path):
+    store=Store(str(tmp_path/"forecast_limit.db"))
+    for epoch in range(100,104):
+        tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,str(epoch))
+        forecast=Forecast("test","1.0",{},epoch%10,(.1,)*10)
+        store.append_forecast("1HZ100V",forecast,tick,epoch)
+    rows=store.forecasts("1HZ100V",limit=2)
+    assert [row["forecast_epoch"] for row in rows]==[102,103]
+
+
+def test_quote_arriving_after_scoring_is_not_used_as_prediction_time_payout(tmp_path):
+    store=Store(str(tmp_path/"late_quote.db"))
+    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"x")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    seq=store.append_forecast("1HZ100V",f,tick,100)
+    # This quote is captured after the forecast's next-epoch deadline (epoch 101).
+    store.append_quote("1HZ100V",f,seq,8.33,1.00,"late-proposal")
+    assert store.forecasts("1HZ100V")[0]["payout"] is None
+    next_tick=store.add_tick("1HZ100V",101,"1.21",2,1,"y")
+    store.score_open_forecasts("1HZ100V",next_tick,101,1)
+    row=store.forecasts("1HZ100V")[0]
+    assert row["actual_digit"]==1
+    assert row["payout"] is None
+    assert row["stake"] is None
+
+
+def test_subscription_id_is_not_treated_as_unique_tick_id(tmp_path):
+    store=Store(str(tmp_path/"subscription_id.db"))
+    first=store.add_tick("1HZ100V",100,"1.20",2,0,"same-subscription-id")
+    second=store.add_tick("1HZ100V",101,"1.21",2,1,"same-subscription-id")
+    assert first is not None and second is not None and second != first
+
+
+def test_symbol_histories_are_separate(tmp_path):
+    store=Store(str(tmp_path/"symbols.db"))
+    store.add_tick("1HZ100V",100,"1.20",2,0,"sub-a")
+    store.add_tick("1HZ50V",100,"1.27",2,7,"sub-b")
+    assert [r["digit"] for r in store.history("1HZ100V")] == [0]
+    assert [r["digit"] for r in store.history("1HZ50V")] == [7]
+
+
+def test_tick_views_use_market_epoch_not_insert_order(tmp_path):
+    store=Store(str(tmp_path/"backfilled_ticks.db"))
+    latest_id=store.add_tick("1HZ100V",102,"1.22",2,2,"live")
+    store.add_tick("1HZ100V",100,"1.20",2,0,"history-1")
+    store.add_tick("1HZ100V",101,"1.21",2,1,"history-2")
+
+    assert [row["epoch"] for row in store.history("1HZ100V")]==[100,101,102]
+    assert [row["epoch"] for row in store.quality_history("1HZ100V")]==[100,101,102]
+    assert store.ticks_frame("1HZ100V")["epoch"].tolist()==[100,101,102]
+    assert store.is_latest_tick("1HZ100V",latest_id)
+
+
+def test_quote_before_next_epoch_is_retained(tmp_path):
+    import time
+    store=Store(str(tmp_path/"timely_quote.db"))
+    epoch=int(time.time())+1000
+    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"sub")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    seq=store.append_forecast("1HZ100V",f,tick,epoch)
+    store.append_quote("1HZ100V",f,seq,8.33,1.00,"timely",epoch)
+    nxt=store.add_tick("1HZ100V",epoch+1,"1.21",2,1,"sub")
+    store.score_open_forecasts("1HZ100V",nxt,epoch+1,1)
+    row=store.forecasts("1HZ100V")[0]
+    assert row["actual_digit"]==1
+    assert row["payout"]=="8.33"
+
+
+def test_final_test_snapshot_is_write_once_and_immutable(tmp_path):
+    store=Store(str(tmp_path/"snapshot.db"))
+    assert store.freeze_research_snapshot("1HZ100V",10000,10000,'{"final_test":"first"}') is True
+    assert store.freeze_research_snapshot("1HZ100V",20000,20000,'{"final_test":"second"}') is False
+    assert store.research_snapshot("1HZ100V")["report_json"]=='{"final_test":"first"}'
+    with store.connect() as c:
+        with pytest.raises(Exception): c.execute("UPDATE research_snapshots SET report_json='{}' WHERE symbol='1HZ100V'")
+        with pytest.raises(Exception): c.execute("DELETE FROM research_snapshots WHERE symbol='1HZ100V'")
+
+
+def test_report_uses_frozen_research_snapshot_after_new_data(tmp_path):
+    import json
+    from bromax.research import generate_report
+    store=Store(str(tmp_path/"frozen_report.db"))
+    frozen={"symbol":"1HZ100V","n_ticks":10000,"final_test_accessed":True,"validation_finalists":["rolling_mode_100"],"strategies":[]}
+    store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",10000,10000,json.dumps(frozen))
+    store.add_tick("1HZ100V",9999999999,"1.20",2,0,"subscription")
+    report=generate_report(store,["1HZ100V"])
+    item=report["symbols"][0]
+    assert item["n_ticks"]==10000
+    assert item["research_snapshot"]["frozen"] is True
+
+
+def test_paper_bot_reserves_open_stakes_against_daily_loss_cap(tmp_path):
+    from decimal import Decimal
+    from bromax.paperbot import PaperBot
+    store=Store(str(tmp_path/"risk.db"))
+    bot=PaperBot(store,Decimal("1"),Decimal("1"),Decimal("1.50"),10,approvals_path=tmp_path/"none.json")
+    assert bot.limits_ok("1HZ100V",Decimal("1")) is True
+    tick=store.add_tick("1HZ100V",100,"1.20",2,0,"subscription")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    seq=store.append_forecast("1HZ100V",f,tick,100)
+    store.append_paper_open("1HZ100V",f,seq,tick,100,Decimal("1"),Decimal("8.33"),"p1",100)
+    assert bot.limits_ok("1HZ100V",Decimal("1")) is False
+    assert bot.limits_ok("1HZ50V",Decimal("1")) is False  # global daily risk cap spans symbols
+    assert bot.approved("1HZ100V","test") is False
+
+
+def test_paperbot_requires_user_approval_and_machine_passed_frozen_report(tmp_path, monkeypatch):
+    import json
+    from decimal import Decimal
+    from bromax.paperbot import PaperBot
+    monkeypatch.chdir(tmp_path)
+    (tmp_path/"reports").mkdir()
+    approval=tmp_path/"approved_strategies.json"
+    approval.write_text(json.dumps({"approved":{"1HZ100V":["rolling_mode_500"]}}))
+    test={"n":6000,"holm_adjusted_p":.001,"hit_rate_block_bootstrap_ci95":[.12,.15],"payout_adjusted":{"n_with_actual_quote":6000,"quote_coverage":1.0,"realized_profit_ci95":[.01,.20]}}
+    report={"symbols":[{"symbol":"1HZ100V","research_snapshot":{"frozen":True,"protocol_version":"1.1.0"},"validation_finalists":["rolling_mode_500"],"strategies":[{"strategy_id":"rolling_mode_500","final_test":test,"final_test_verdict":"evidence_of_edge"}]}]}
+    (tmp_path/"reports"/"bromax_report.json").write_text(json.dumps(report))
+    bot=PaperBot(Store(str(tmp_path/"db.sqlite3")),Decimal("1"),Decimal("1"),Decimal("10"),100,approvals_path=approval)
+    assert bot.approved("1HZ100V","rolling_mode_500") is True
+    assert bot.approved("1HZ100V","cumulative_mode") is False
+
+
+def test_settings_reject_unsafe_or_inconsistent_paper_limits():
+    from decimal import Decimal
+    from bromax.config import Settings
+    with pytest.raises(ValueError): Settings(paper_stake=Decimal("2"),max_paper_stake=Decimal("1"))
+    with pytest.raises(ValueError): Settings(min_history_ticks=100)
+
+
+def test_proposal_spot_time_must_match_forecast_epoch(tmp_path):
+    import time
+    store=Store(str(tmp_path/"spot_time.db"))
+    epoch=int(time.time())+1000
+    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"sub")
+    f=Forecast("test","1.0",{},0,(1.0,)+(0.0,)*9)
+    seq=store.append_forecast("1HZ100V",f,tick,epoch)
+    store.append_quote("1HZ100V",f,seq,8.33,1.00,"mismatched",epoch-1)
+    nxt=store.add_tick("1HZ100V",epoch+1,"1.21",2,1,"sub")
+    store.score_open_forecasts("1HZ100V",nxt,epoch+1,1)
+    assert store.forecasts("1HZ100V")[0]["payout"] is None
+
+
+def test_settings_reject_zero_pending_quote_queue():
+    from bromax.config import Settings
+    with pytest.raises(ValueError): Settings(max_pending_quote_tasks=0)
+
+
+def test_paper_bot_rejects_current_quote_with_nonpositive_model_ev(tmp_path, monkeypatch):
+    from decimal import Decimal
+    from bromax.paperbot import PaperBot
+    from bromax.strategies import Forecast
+    store=Store(str(tmp_path/"ev_gate.db"))
+    bot=PaperBot(store,Decimal("1"),Decimal("1"),Decimal("10"),100,approvals_path=tmp_path/"none.json")
+    bot.approved=lambda symbol,strategy_id: True
+    f=Forecast("test","1.0",{},0,(.10,)+(.10,)*9)
+    assert bot.record("1HZ100V",f,1,1,100,Decimal("1"),Decimal("8"),"p",100)=="current_quote_model_ev_nonpositive"
+
+
+def test_versioned_research_snapshots_preserve_prior_protocols(tmp_path):
+    store=Store(tmp_path/"versioned.sqlite3")
+    assert store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",12000,12000,'{"protocol":"1.1.0"}') is True
+    assert store.freeze_research_snapshot_versioned("1HZ100V","1.1.0",13000,13000,'{"protocol":"changed"}') is False
+    assert store.research_snapshot_versioned("1HZ100V","1.1.0")["report_json"]=='{"protocol":"1.1.0"}'
+    assert store.research_snapshot_versioned("1HZ100V","1.2.0") is None
+    with store.connect() as c:
+        with pytest.raises(Exception):
+            c.execute("UPDATE research_snapshots_v2 SET report_json='{}' WHERE symbol='1HZ100V'")
+
+
+def test_settings_protocol_requires_one_second_symbols():
+    from bromax.config import Settings
+    with pytest.raises(ValueError, match="1HZ"):
+        Settings(symbols=("R_100",))
+
+
+def test_duration_quote_ledger_captures_actual_quote_and_exact_settlement(tmp_path):
+    import time
+    from decimal import Decimal
+    store=Store(str(tmp_path/"duration.sqlite3"))
+    epoch=int(time.time())+1000
+    tick=store.add_tick("1HZ100V",epoch,"1.20",2,0,"x")
+    f=Forecast("test","1.0",{},2,(0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1))
+    seq=store.append_forecast("1HZ100V",f,tick,epoch)
+    assert store.append_duration_quote("1HZ100V",f,seq,tick,epoch,2,Decimal("1"),Decimal("9"),"proposal",epoch)
+    target=store.add_tick("1HZ100V",epoch+2,"1.23",2,3,"y")
+    settled=store.settle_duration_contracts("1HZ100V",target,epoch+2,3)
+    assert settled[0]["duration_ticks"] == 2
+    assert settled[0]["hit"] == 0
+    assert settled[0]["pnl"] == "-1"
+    assert len(store.duration_events("1HZ100V")) == 2
+    with store.connect() as c:
+        with pytest.raises(Exception): c.execute("UPDATE duration_events SET payout='100' WHERE event_type='QUOTE'")
+```
+
+## `tests/test_timing.py`
+
+```python
+from bromax.timing import evaluate_timing, wilson
+
+
+def test_wilson_bounds():
+    lo, hi = wilson(10, 100)
+    assert 0 < lo < .1 < hi < 1
+
+
+def test_timing_uses_future_horizon_and_never_authorizes_execution():
+    ticks = [
+        {'id': i+1, 'epoch': 1000+i, 'digit': i % 10, 'quote_text': f'{100+i/100:.2f}', 'symbol': '1HZ100V'}
+        for i in range(80)
+    ]
+    forecasts = [{'event_type':'FORECAST','forecast_tick_id':i+1,'prediction':(i+1)%10,'strategy_id':'test'} for i in range(70)]
+    result = evaluate_timing(ticks, forecasts, durations=(1,2,3))
+    assert result['execution_authorized'] is False
+    assert result['durations_tested_ticks'] == [1,2,3]
+    assert {x['duration_ticks'] for x in result['strategies']} == {1,2,3}
+    assert result['best_duration'] is None
+
+
+def test_missing_epoch_gap_is_not_scored():
+    ticks = [
+        {'id':1,'epoch':100,'digit':1,'quote_text':'1.1'},
+        {'id':2,'epoch':101,'digit':2,'quote_text':'1.2'},
+        {'id':3,'epoch':103,'digit':3,'quote_text':'1.3'},
+        {'id':4,'epoch':104,'digit':4,'quote_text':'1.4'},
+    ]
+    forecasts = [{'forecast_tick_id':1,'prediction':2,'strategy_id':'s'}]
+    result = evaluate_timing(ticks, forecasts, durations=(1,2))
+    rows = {x['duration_ticks']:x for x in result['strategies']}
+    assert rows[1]['n'] == 1
+    assert 2 not in rows
+
+
+def test_volatility_gate_is_fail_closed_without_holdout_evidence():
+    ticks = [
+        {'id': i+1, 'epoch': 2000+i, 'digit': (i*7)%10,
+         'quote_text': f'{100+i/100:.2f}', 'symbol': '1HZ100V'}
+        for i in range(120)
+    ]
+    forecasts = [
+        {'forecast_tick_id': i+1, 'prediction': (i*3)%10, 'strategy_id': 'candidate'}
+        for i in range(100)
+    ]
+    result = evaluate_timing(ticks, forecasts, durations=(1,))
+    assert result['execution_authorized'] is False
+    row = result['strategies'][0]
+    assert all(x['status'] == 'UNCONFIRMED' for x in row['volatility_regimes'])
+```

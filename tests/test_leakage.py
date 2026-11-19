@@ -33,7 +33,13 @@ def test_execution_interface_is_disabled_and_raises():
     from bromax.paperbot import ExecutionInterface
     interface=ExecutionInterface()
     assert interface.enabled is False
-    with pytest.raises(RuntimeError): asyncio.run(interface.execute())
+    assert interface.kill_switch_engaged is True
+    with pytest.raises(RuntimeError,match="kill switch"):
+        asyncio.run(interface.execute())
+    interface.engage_kill_switch()
+    assert interface.kill_switch_engaged is True
+    with pytest.raises(RuntimeError,match="kill switch"):
+        asyncio.run(interface.execute())
 
 
 def test_batch_backtest_matches_online_strategy_definitions():
