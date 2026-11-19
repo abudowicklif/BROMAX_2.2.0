@@ -1,6 +1,6 @@
 # BROMAX 2.2.0 ? Complete Source Listing
 
-This document is generated from the packaged BROMAX 2.2.0 source tree. Local credentials, databases, reports, and virtual environments are excluded.
+Generated from the packaged BROMAX source tree. Local credentials, databases, reports, and virtual environments are excluded.
 
 ---
 
@@ -9,6 +9,589 @@ This document is generated from the packaged BROMAX 2.2.0 source tree. Local cre
 ```python
 """BROMAX: auditable MATCH-only research and paper simulation."""
 __version__ = "1.0.0"
+```
+
+---
+
+## `bromax/agents.py`
+
+```python
+"""Deterministic specialist agents and the final paper-signal coordinator.
+
+All probabilities, validation evidence, payout values, and approvals are
+produced by the existing Python research and risk functions. No LLM output can
+change a numerical result or authorize a signal.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from decimal import Decimal
+import logging
+import math
+import time
+from typing import Any, Callable, Literal
+
+from .digits import extract_last_digit
+
+AgentStatus = Literal["APPROVED", "REJECTED", "INSUFFICIENT_EVIDENCE", "MONITORING", "ERROR"]
+log = logging.getLogger("bromax.agents")
+
+
+@dataclass(frozen=True)
+class AgentResult:
+    agent_id: str
+    status: AgentStatus
+    evaluated_at: str
+    duration_ms: float
+    summary: str
+    reasons: tuple[str, ...]
+    metrics: dict[str, Any]
+    output: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _result(agent_id: str, status: AgentStatus, summary: str, reasons=(), metrics=None, output=None):
+    return AgentResult(
+        agent_id=agent_id,
+        status=status,
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+        duration_ms=0.0,
+        summary=summary,
+        reasons=tuple(dict.fromkeys(str(reason) for reason in reasons if reason)),
+        metrics=metrics or {},
+        output=output or {},
+    )
+
+
+def _run(agent_id: str, evaluate: Callable[[], AgentResult]) -> AgentResult:
+    started = time.perf_counter()
+    try:
+        result = evaluate()
+    except (KeyError, TypeError, ValueError, ArithmeticError, OverflowError) as error:
+        log.exception("Agent %s rejected malformed analysis input", agent_id)
+        result = _result(agent_id, "ERROR", "The agent could not validate its analysis input.", (str(error),))
+    result = replace(result, duration_ms=round((time.perf_counter() - started) * 1000, 3))
+    log.info("Agent %s status=%s duration_ms=%.3f", agent_id, result.status, result.duration_ms)
+    return result
+
+
+class DataIntelligenceAgent:
+    """Input: recent stored ticks and collector freshness. Output: data-quality gate."""
+
+    agent_id = "data_intelligence"
+
+    def run(self, ticks: list[dict[str, Any]], feed_stale: bool, max_age_seconds: int, errors=()):
+        def evaluate():
+            if len(ticks) < 2:
+                return _result(
+                    self.agent_id, "INSUFFICIENT_EVIDENCE", "At least two stored ticks are required.",
+                    ("Tick history is too short to verify sequence continuity.",),
+                    {"ticks_checked": len(ticks), "quality_score": None},
+                )
+            reasons = []
+            epochs = [int(row["epoch"]) for row in ticks]
+            duplicate_free = len(epochs) == len(set(epochs))
+            monotonic = all(right > left for left, right in zip(epochs, epochs[1:]))
+            precision_valid = True
+            malformed = 0
+            for row in ticks:
+                try:
+                    _, digit = extract_last_digit(row["quote_text"], row["pip_size"])
+                    if digit != row["digit"]:
+                        precision_valid = False
+                        malformed += 1
+                except (KeyError, TypeError, ValueError):
+                    precision_valid = False
+                    malformed += 1
+            recent = ticks[-21:]
+            gaps = [right - left - 1 for left, right in zip(
+                [int(row["epoch"]) for row in recent],
+                [int(row["epoch"]) for row in recent[1:]],
+            ) if right - left > 1]
+            recent_contiguous = not gaps and all(
+                right - left == 1 for left, right in zip(
+                    [int(row["epoch"]) for row in recent],
+                    [int(row["epoch"]) for row in recent[1:]],
+                )
+            )
+            latest_received = datetime.fromisoformat(str(ticks[-1]["received_utc"]))
+            if latest_received.tzinfo is None:
+                latest_received = latest_received.replace(tzinfo=timezone.utc)
+            raw_age_seconds = (datetime.now(timezone.utc) - latest_received).total_seconds()
+            age_seconds = max(0.0, raw_age_seconds)
+            fresh = not feed_stale and raw_age_seconds >= -1 and age_seconds <= max_age_seconds
+            checks = {
+                "fresh": fresh,
+                "timestamp_not_future": raw_age_seconds >= -1,
+                "unique_epochs": duplicate_free,
+                "monotonic_epochs": monotonic,
+                "displayed_digits_valid": precision_valid,
+                "recent_ticks_contiguous": recent_contiguous,
+            }
+            if not fresh:
+                reasons.append("Market data is stale or exceeds the configured freshness limit.")
+            if not duplicate_free:
+                reasons.append("Duplicate tick epochs were detected.")
+            if not monotonic:
+                reasons.append("Tick timestamps are not strictly increasing.")
+            if not precision_valid:
+                reasons.append("Stored quotes, pip precision, and extracted digits do not agree.")
+            if not recent_contiguous:
+                reasons.append("A missing tick was detected in the recent sequence.")
+            status: AgentStatus = "APPROVED" if all(checks.values()) else "REJECTED"
+            score = round(100 * sum(checks.values()) / len(checks))
+            return _result(
+                self.agent_id, status,
+                "Recent ticks passed all data-quality checks." if status == "APPROVED" else "Data quality blocks new signals.",
+                reasons,
+                {
+                    "quality_score": score,
+                    "ticks_checked": len(ticks),
+                    "latest_tick_age_seconds": round(age_seconds, 3),
+                    "missing_ticks_recent": sum(gaps),
+                    "malformed_ticks": malformed,
+                    "checks": checks,
+                    "recent_collector_errors": list(errors)[-5:],
+                },
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class StrategyResearchAgent:
+    """Input: frozen per-symbol report. Output: validation/final-test disposition."""
+
+    agent_id = "strategy_research"
+
+    def run(self, report_item: dict[str, Any]):
+        def evaluate():
+            evidence = report_item.get("digit_evidence") or {}
+            selected = evidence.get("selected_strategy_id")
+            finalists = report_item.get("validation_finalists") or []
+            strategies = report_item.get("strategies") or []
+            result = next((row for row in strategies if row.get("strategy_id") == selected), None)
+            if not selected or not result:
+                return _result(
+                    self.agent_id, "INSUFFICIENT_EVIDENCE", "No development-selected strategy has report evidence.",
+                    ("A selected strategy and its frozen research result are unavailable.",),
+                )
+            validation = result.get("validation") or {}
+            final_test = result.get("final_test") or {}
+            verdict = result.get("final_test_verdict") or result.get("final_test_status")
+            finalist = selected in finalists
+            reasons = []
+            if not finalist:
+                reasons.append("The selected strategy did not pass the pre-registered validation gate.")
+            if not final_test:
+                reasons.append("The untouched final test is unavailable for the selected strategy.")
+            elif verdict != "evidence_of_edge":
+                reasons.append("The selected strategy lacks positive untouched final-test evidence.")
+            passed = finalist and bool(final_test) and verdict == "evidence_of_edge"
+            return _result(
+                self.agent_id, "APPROVED" if passed else "REJECTED" if final_test else "INSUFFICIENT_EVIDENCE",
+                "The strategy passed validation and untouched-test gates." if passed else "The strategy is not validated for a paper signal.",
+                reasons,
+                {
+                    "selected_strategy_id": selected,
+                    "validation_finalist": finalist,
+                    "validation_n": validation.get("n"),
+                    "validation_quote_coverage": (validation.get("payout_adjusted") or {}).get("quote_coverage"),
+                    "final_test_verdict": verdict,
+                    "final_test_n": final_test.get("n"),
+                },
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class ProbabilityCalibrationAgent:
+    """Input: per-digit evidence and candidate probability vectors. Output: numeric integrity."""
+
+    agent_id = "probability_calibration"
+
+    def run(self, digit_analysis: dict[str, Any], signals: dict[str, Any]):
+        def evaluate():
+            rows = digit_analysis.get("digits") or []
+            digits = sorted(int(row["digit"]) for row in rows)
+            if digits != list(range(10)):
+                return _result(
+                    self.agent_id, "REJECTED", "The analysis does not contain exactly one row for every digit.",
+                    ("Digit coverage must be exactly 0 through 9.",),
+                    {"digit_rows": len(rows)},
+                )
+            reasons = []
+            estimates = 0
+            health_scores = []
+            calibration_errors = []
+            for row in rows:
+                probability = row.get("estimated_win_probability")
+                if probability is not None:
+                    probability = float(probability)
+                    if not math.isfinite(probability) or not 0 <= probability <= 1:
+                        reasons.append(f"Digit {row['digit']} has an invalid probability.")
+                    else:
+                        estimates += 1
+                health = row.get("health_percent")
+                if health is not None:
+                    health = float(health)
+                    if not math.isfinite(health) or not 0 <= health <= 100:
+                        reasons.append(f"Digit {row['digit']} has an invalid evidence-health score.")
+                    else:
+                        health_scores.append(health)
+                calibration = (row.get("validation") or {}).get("absolute_calibration_error")
+                if calibration is not None:
+                    calibration_errors.append(float(calibration))
+            vectors = signals.get("signals") or []
+            disagreement = set()
+            for signal in vectors:
+                probabilities = [float(value) for value in signal.get("probabilities") or []]
+                if len(probabilities) != 10 or any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities):
+                    reasons.append(f"Strategy {signal.get('strategy_id', 'unknown')} has an invalid ten-digit probability vector.")
+                    continue
+                if not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-6):
+                    reasons.append(f"Strategy {signal.get('strategy_id', 'unknown')} probabilities do not sum to one.")
+                    continue
+                predicted_digit=int(signal["predicted_digit"])
+                if predicted_digit not in range(10):
+                    reasons.append(f"Strategy {signal.get('strategy_id', 'unknown')} predicted an invalid digit.")
+                    continue
+                disagreement.add(predicted_digit)
+            if reasons:
+                return _result(
+                    self.agent_id, "REJECTED", "Probability output failed numerical validation.", reasons,
+                    {"digit_rows": len(rows), "valid_digit_estimates": estimates},
+                )
+            if not vectors or estimates != 10:
+                return _result(
+                    self.agent_id, "INSUFFICIENT_EVIDENCE", "A current probability estimate is unavailable for every digit.",
+                    ("Probability output remains blank where the selected model has no valid estimate.",),
+                    {"digit_rows": len(rows), "valid_digit_estimates": estimates, "candidate_vectors": len(vectors)},
+                )
+            return _result(
+                self.agent_id, "APPROVED", "Ten finite digit probabilities and candidate vectors passed integrity checks.",
+                metrics={
+                    "valid_digit_estimates": estimates,
+                    "candidate_vectors": len(vectors),
+                    "model_disagreement_count": len(disagreement),
+                    "mean_evidence_health": round(sum(health_scores) / len(health_scores), 3) if health_scores else None,
+                    "mean_validation_calibration_error": round(sum(calibration_errors) / len(calibration_errors), 6) if calibration_errors else None,
+                },
+                output={"candidate_digits": sorted(disagreement)},
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class MarketRegimeAgent:
+    """Input: timing diagnostics and current volatility filter. Output: regime compatibility."""
+
+    agent_id = "market_regime"
+
+    def run(self, timing: dict[str, Any], digit_analysis: dict[str, Any]):
+        def evaluate():
+            filter_data = digit_analysis.get("volatility_filter") or {}
+            status = filter_data.get("status")
+            if status == "PASS":
+                agent_status: AgentStatus = "APPROVED"
+                reasons = ()
+            elif status == "FAIL":
+                agent_status = "REJECTED"
+                reasons = ("The selected strategy is not statistically confirmed in the current volatility regime.",)
+            else:
+                agent_status = "INSUFFICIENT_EVIDENCE"
+                reasons = ("Current-regime validation evidence is unavailable.",)
+            vol = digit_analysis.get("volatility") or {}
+            return _result(
+                self.agent_id, agent_status,
+                "Current regime passed its strategy-specific holdout filter." if agent_status == "APPROVED" else "Current regime does not approve a signal.",
+                reasons,
+                {
+                    "current_regime": filter_data.get("regime"),
+                    "volatility_health_percent": filter_data.get("health_percent"),
+                    "checks_passed": filter_data.get("checks_passed"),
+                    "checks_total": filter_data.get("checks_total"),
+                    "short_term_volatility": vol.get("short_term"),
+                    "long_term_volatility": vol.get("long_term"),
+                    "strategies_evaluated": len(timing.get("strategies") or []),
+                },
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class ContractIntelligenceAgent:
+    """Input: approved-ready candidate and its digit/duration quote. Output: EV verification."""
+
+    agent_id = "contract_intelligence"
+
+    def run(self, ready: dict[str, Any], digit_analysis: dict[str, Any]):
+        def evaluate():
+            signal = ready.get("signal") if ready.get("eligible") is True else None
+            if not signal:
+                status = "REJECTED" if ready.get("status") in {"REJECTED", "EXPIRED"} else "INSUFFICIENT_EVIDENCE"
+                return _result(
+                    self.agent_id, status, "No current fully-qualified contract quote is available.",
+                    (ready.get("reason") or "No eligible quote-backed signal exists.",),
+                )
+            digit = int(signal["predicted_digit"])
+            duration = int(signal["duration"])
+            row = next((item for item in digit_analysis.get("digits",[]) if int(item["digit"]) == digit), None)
+            duration_result = (row or {}).get("durations", {}).get(str(duration), {})
+            quote = duration_result.get("current_quote") or {}
+            reasons = []
+            try:
+                probability = Decimal(str(signal["probability"]))
+                stake = Decimal(str(signal["stake"]))
+                payout = Decimal(str(signal["payout"]))
+                expected_value = probability * payout - stake
+                published_ev = Decimal(str(signal["expected_value"]))
+                spot_time = int(quote["spot_time"])
+                forecast_epoch = int(signal["forecast_epoch"])
+                if probability < 0 or probability > 1 or stake <= 0 or payout <= 0:
+                    reasons.append("Probability, stake, or payout is outside its valid range.")
+                if expected_value <= 0:
+                    reasons.append("The quoted expected value is not positive.")
+                if expected_value != published_ev:
+                    reasons.append("The published expected value does not match the quoted contract inputs.")
+                if not quote.get("valid") or spot_time != forecast_epoch:
+                    reasons.append("The proposal is unavailable, expired, or mismatched to the forecast tick.")
+                if not duration_result or duration_result.get("decision") != "PAPER TRADE CANDIDATE":
+                    reasons.append("Per-digit duration evidence did not approve this exact contract.")
+                if signal.get("duration_profitability_status") != "OUT_OF_SAMPLE_PROFIT_EVIDENCE":
+                    reasons.append("The duration lacks quote-backed out-of-sample profitability evidence.")
+            except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+                reasons.append(f"Required quote fields failed validation: {error}")
+                expected_value = None
+                probability = stake = payout = None
+            status: AgentStatus = "APPROVED" if not reasons else "REJECTED"
+            return _result(
+                self.agent_id, status,
+                "The fresh quote and expected value match the validated contract." if status == "APPROVED" else "Contract quote verification failed.",
+                reasons,
+                {
+                    "digit": digit,
+                    "duration_ticks": duration,
+                    "probability": str(probability) if probability is not None else None,
+                    "stake": str(stake) if stake is not None else None,
+                    "gross_payout": str(payout) if payout is not None else None,
+                    "expected_value": str(expected_value) if expected_value is not None else None,
+                    "quote_spot_time": quote.get("spot_time"),
+                    "forecast_epoch": signal.get("forecast_epoch"),
+                },
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class RiskSignalApprovalAgent:
+    """Input: specialist results and READY response. Output: independent deterministic veto."""
+
+    agent_id = "risk_signal_approval"
+
+    def run(self, results: list[AgentResult], ready: dict[str, Any], digit_analysis: dict[str, Any], consistent: bool):
+        def evaluate():
+            by_id = {result.agent_id: result for result in results}
+            signal = ready.get("signal") if ready.get("eligible") is True else None
+            checks = {
+                "snapshot_consistent": consistent,
+                "data_quality": by_id.get("data_intelligence") is not None and by_id["data_intelligence"].status == "APPROVED",
+                "strategy_validation": by_id.get("strategy_research") is not None and by_id["strategy_research"].status == "APPROVED",
+                "probability_integrity": by_id.get("probability_calibration") is not None and by_id["probability_calibration"].status == "APPROVED",
+                "market_regime": by_id.get("market_regime") is not None and by_id["market_regime"].status == "APPROVED",
+                "contract_validation": by_id.get("contract_intelligence") is not None and by_id["contract_intelligence"].status == "APPROVED",
+                "ready_gate": signal is not None,
+            }
+            reasons = []
+            if not consistent:
+                reasons.append("The market tick changed during analysis; discard this snapshot.")
+            for key, passed in checks.items():
+                if not passed and key != "snapshot_consistent":
+                    agent = {
+                        "data_quality":"data_intelligence",
+                        "strategy_validation":"strategy_research",
+                        "probability_integrity":"probability_calibration",
+                        "market_regime":"market_regime",
+                        "contract_validation":"contract_intelligence",
+                    }.get(key)
+                    reason = next(iter(by_id[agent].reasons),None) if agent and agent in by_id else None
+                    reasons.append(reason or f"Required check failed: {key.replace('_',' ')}.")
+            if signal and signal.get("strategy_id") not in (ready.get("approved_strategy_ids") or []):
+                reasons.append("The strategy does not have explicit user approval.")
+                checks["explicit_user_approval"] = False
+            elif signal:
+                checks["explicit_user_approval"] = True
+            if signal and signal.get("execution_mode") != "PAPER_SIMULATION_ONLY":
+                reasons.append("The candidate is not marked as paper-simulation-only.")
+                checks["paper_only_mode"] = False
+            elif signal:
+                checks["paper_only_mode"] = True
+            digit = int(signal["predicted_digit"]) if signal else None
+            digit_row = next((row for row in digit_analysis.get("digits",[]) if int(row["digit"]) == digit),None) if digit is not None else None
+            if signal and (not digit_row or digit_row.get("decision") != "PAPER TRADE CANDIDATE"):
+                reasons.append("Per-digit untouched evidence did not approve the selected digit.")
+                checks["per_digit_evidence"] = False
+            elif signal:
+                checks["per_digit_evidence"] = True
+            failed = any(not passed for passed in checks.values())
+            if not failed:
+                status: AgentStatus = "APPROVED"
+                summary = "All independent paper-signal safety checks passed."
+            elif not consistent or any(
+                by_id.get(agent) and by_id[agent].status == "INSUFFICIENT_EVIDENCE"
+                for agent in ("data_intelligence","strategy_research","probability_calibration","market_regime","contract_intelligence")
+            ):
+                status = "INSUFFICIENT_EVIDENCE"
+                summary = "No trade: required evidence is incomplete."
+            else:
+                status = "REJECTED"
+                summary = "Signal rejected by an independent risk check."
+            return _result(
+                self.agent_id, status, summary, reasons,
+                {"checks":checks,"checks_passed":sum(checks.values()),"checks_total":len(checks)},
+                {"signal":signal if status=="APPROVED" else None,"trade_authorized":status=="APPROVED"},
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class PerformanceLearningAgent:
+    """Input: immutable paper/forecast ledgers and prior agent runs. Output: monitoring metrics."""
+
+    agent_id = "performance_learning"
+
+    def run(self, paper_events: list[dict[str, Any]], forecasts: list[dict[str, Any]], prior_runs: list[dict[str, Any]]):
+        def evaluate():
+            opened = [event for event in paper_events if event.get("event_type") == "PAPER_OPEN"]
+            settled = [event for event in paper_events if event.get("event_type") == "PAPER_SETTLE"]
+            wins = sum(event.get("hit") == 1 for event in settled)
+            pnls = [float(event["paper_pnl"]) for event in settled if event.get("paper_pnl") is not None]
+            scored = [row for row in forecasts if row.get("actual_digit") is not None and row.get("probabilities")]
+            brier_values = []
+            calibration_values = []
+            for row in scored:
+                probabilities = [float(value) for value in row["probabilities"]]
+                actual = int(row["actual_digit"])
+                prediction = int(row["prediction"])
+                if (
+                    len(probabilities) != 10
+                    or any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities)
+                    or not math.isclose(sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-6)
+                    or actual not in range(10)
+                    or prediction not in range(10)
+                ):
+                    continue
+                brier_values.append(sum((probabilities[digit] - int(digit == actual)) ** 2 for digit in range(10)))
+                calibration_values.append((probabilities[prediction], int(prediction == actual)))
+            brier = sum(brier_values) / len(brier_values) if brier_values else None
+            calibration_error = (
+                abs(sum(prob for prob, _ in calibration_values) / len(calibration_values)
+                    - sum(hit for _, hit in calibration_values) / len(calibration_values))
+                if calibration_values else None
+            )
+            statuses: dict[str, dict[str, Any]] = {}
+            for run in prior_runs:
+                for item in run.get("agent_results",[]):
+                    agent_id=item.get("agent_id")
+                    if not agent_id:
+                        continue
+                    summary=statuses.setdefault(agent_id,{"runs":0,"errors":0,"last_status":None})
+                    summary["runs"]+=1
+                    summary["errors"]+=int(item.get("status")=="ERROR")
+                    if summary["last_status"] is None:
+                        summary["last_status"]=item.get("status")
+            for summary in statuses.values():
+                summary["error_rate"]=summary["errors"]/summary["runs"] if summary["runs"] else None
+            has_results=bool(settled or brier_values)
+            return _result(
+                self.agent_id, "MONITORING" if has_results or prior_runs else "INSUFFICIENT_EVIDENCE",
+                "Performance monitoring uses recorded outcomes only." if has_results else "No settled outcomes are available yet.",
+                () if has_results else ("Paper and scored forecast histories are empty.",),
+                {
+                    "paper_opened":len(opened),
+                    "paper_settled":len(settled),
+                    "wins":wins,
+                    "losses":len(settled)-wins,
+                    "win_rate":wins/len(settled) if settled else None,
+                    "net_paper_profit":sum(pnls) if pnls else None,
+                    "scored_forecasts":len(brier_values),
+                    "recent_brier_multiclass":brier,
+                    "recent_absolute_calibration_error":calibration_error,
+                    "monitored_agents":statuses,
+                },
+            )
+        return _run(self.agent_id, evaluate)
+
+
+class ChiefIntelligenceCoordinator:
+    """Input: all seven specialist results. Output: one coherent paper-only decision."""
+
+    agent_id = "chief_intelligence_coordinator"
+
+    def coordinate(self, specialist_results: list[AgentResult], risk_result: AgentResult, consistent: bool):
+        def evaluate():
+            if not consistent:
+                final_status = "NO TRADE — INSUFFICIENT EVIDENCE"
+            elif risk_result.status == "APPROVED":
+                final_status = "APPROVED — PAPER SIGNAL"
+            elif risk_result.status == "REJECTED":
+                final_status = "REJECTED — FAILED VALIDATION"
+            else:
+                final_status = "NO TRADE — INSUFFICIENT EVIDENCE"
+            errors=[result.agent_id for result in specialist_results if result.status=="ERROR"]
+            if errors:
+                final_status="NO TRADE — INSUFFICIENT EVIDENCE"
+            return _result(
+                self.agent_id,
+                "APPROVED" if final_status=="APPROVED — PAPER SIGNAL" else
+                "REJECTED" if final_status=="REJECTED — FAILED VALIDATION" else "INSUFFICIENT_EVIDENCE",
+                final_status,
+                risk_result.reasons,
+                {
+                    "specialists_completed":len(specialist_results),
+                    "specialist_errors":errors,
+                    "snapshot_consistent":consistent,
+                    "optional_llm_research":"DISABLED_NOT_REQUIRED",
+                },
+                {"final_status":final_status,"trade_authorized":final_status=="APPROVED — PAPER SIGNAL"},
+            )
+        return _run(self.agent_id, evaluate)
+
+
+def coordinate_snapshot(
+    *,
+    report_item: dict[str, Any],
+    digit_analysis: dict[str, Any],
+    signal_data: dict[str, Any],
+    timing: dict[str, Any],
+    ready: dict[str, Any],
+    quality_ticks: list[dict[str, Any]],
+    feed_stale: bool,
+    max_data_age_seconds: int,
+    collector_errors: list[str],
+    paper_events: list[dict[str, Any]],
+    forecasts: list[dict[str, Any]],
+    prior_runs: list[dict[str, Any]],
+    consistent: bool,
+    snapshot_timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Run the eight deterministic roles over explicit, role-scoped inputs."""
+    data_result=DataIntelligenceAgent().run(quality_ticks,feed_stale,max_data_age_seconds,collector_errors)
+    strategy_result=StrategyResearchAgent().run(report_item)
+    probability_result=ProbabilityCalibrationAgent().run(digit_analysis,signal_data)
+    regime_result=MarketRegimeAgent().run(timing,digit_analysis)
+    contract_result=ContractIntelligenceAgent().run(ready,digit_analysis)
+    first_five=[data_result,strategy_result,probability_result,regime_result,contract_result]
+    risk_result=RiskSignalApprovalAgent().run(first_five,ready,digit_analysis,consistent)
+    performance_result=PerformanceLearningAgent().run(paper_events,forecasts,prior_runs)
+    specialist_results=first_five+[risk_result,performance_result]
+    coordinator_result=ChiefIntelligenceCoordinator().coordinate(specialist_results,risk_result,consistent)
+    results=specialist_results+[coordinator_result]
+    timestamp=snapshot_timestamp or datetime.now(timezone.utc).isoformat()
+    results=[replace(result,evaluated_at=timestamp) for result in results]
+    coordinator_result=results[-1]
+    decision=coordinator_result.output
+    return {
+        "decision":decision,
+        "agents":[result.as_dict() for result in results],
+        "performance":performance_result.metrics,
+    }
 ```
 
 ---
@@ -27,10 +610,12 @@ from .config import Settings
 from .storage import Store
 from .collector import MarketCollector
 from .paperbot import PaperBot
+from .agents import coordinate_snapshot
 from .reporting import write_report
 from .intelligence import analyze_ticks
 from .timing import evaluate_timing, evaluate_payout_timing
 from .strategies import candidate_strategies, ForecastContext
+from uuid import uuid4
 
 logging.basicConfig(level=logging.INFO)
 settings=Settings.from_env(); store=Store(settings.database_path)
@@ -527,6 +1112,124 @@ def digit_analysis(symbol: str):
         "note":"A digit's health is a research evidence score, not a win probability. Every displayed estimate comes from the current model or recorded outcomes. TRADE status is paper-only and requires all evidence, quote, timing, approval and risk gates.",
     }
 
+@app.get("/decision")
+def unified_decision(symbol: str):
+    """Return one timestamped, internally checked paper-only decision snapshot."""
+    from datetime import datetime, timezone
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    snapshot_id=str(uuid4())
+    snapshot_timestamp=datetime.now(timezone.utc).isoformat()
+    initial_ticks=store.quality_history(symbol,1)
+    initial_tick_id=initial_ticks[-1]["id"] if initial_ticks else None
+    report_data=report()
+    report_item=next((item for item in report_data.get("symbols",[]) if item.get("symbol")==symbol),{})
+    digit_data=digit_analysis(symbol)
+    signal_data=signals(symbol)
+    timing_data=timing_research(symbol)
+    ready=ready_signal(symbol)
+    quality_ticks=store.quality_history(symbol,21)
+    paper_events=store.paper_events(symbol)
+    forecast_rows=store.forecasts(symbol,limit=5000)
+    prior_runs=store.agent_runs(symbol,limit=20)
+    final_tick=store.quality_history(symbol,1)
+    final_tick_id=final_tick[-1]["id"] if final_tick else None
+    current_signal_tick_id=signal_data.get("observed_tick_id")
+    digit_tick=(digit_data.get("latest_tick") or {}).get("id")
+    consistent=bool(
+        initial_tick_id is not None
+        and initial_tick_id==final_tick_id
+        and current_signal_tick_id==initial_tick_id
+        and digit_tick==initial_tick_id
+    )
+    feed_stale=(
+        collector.last_received.get(symbol) is None
+        or time.time()-collector.last_received[symbol]>settings.max_data_age_seconds
+    )
+    coordinated=coordinate_snapshot(
+        report_item=report_item,
+        digit_analysis=digit_data,
+        signal_data=signal_data,
+        timing=timing_data,
+        ready=ready,
+        quality_ticks=quality_ticks,
+        feed_stale=feed_stale,
+        max_data_age_seconds=settings.max_data_age_seconds,
+        collector_errors=collector.errors,
+        paper_events=paper_events,
+        forecasts=forecast_rows,
+        prior_runs=prior_runs,
+        consistent=consistent,
+        snapshot_timestamp=snapshot_timestamp,
+    )
+    decision_data=coordinated["decision"]
+    risk_result=next(item for item in coordinated["agents"] if item["agent_id"]=="risk_signal_approval")
+    approved_signal=decision_data.get("signal") if decision_data.get("trade_authorized") else None
+    decision_key="|".join(str(value) for value in (
+        decision_data.get("final_status"),
+        (approved_signal or {}).get("signal_id"),
+        (approved_signal or {}).get("predicted_digit"),
+        (approved_signal or {}).get("duration"),
+        (approved_signal or {}).get("probability"),
+    ))
+    persisted=store.record_agent_run(
+        snapshot_id=snapshot_id,
+        symbol=symbol,
+        snapshot_tick_id=final_tick_id,
+        final_status=decision_data.get("final_status","NO TRADE — INSUFFICIENT EVIDENCE"),
+        decision_key=decision_key,
+        agent_results=coordinated["agents"],
+    )
+    signal_digit=int(approved_signal["predicted_digit"]) if approved_signal else None
+    digit_predictions=[]
+    for row in digit_data.get("digits",[]):
+        is_approved=bool(
+            approved_signal
+            and int(row["digit"])==signal_digit
+            and row.get("decision")=="PAPER TRADE CANDIDATE"
+        )
+        rejection_reasons=list(row.get("reasons") or [])
+        if not is_approved and row.get("decision")=="PAPER TRADE CANDIDATE":
+            rejection_reasons.extend(risk_result["reasons"])
+        digit_predictions.append({
+            "digit":int(row["digit"]),
+            "estimated_win_probability":row.get("estimated_win_probability"),
+            "health_percent":row.get("health_percent"),
+            "decision":"TRADE" if is_approved else "NO TRADE",
+            "reasons":[] if is_approved else list(dict.fromkeys(rejection_reasons or ["No fully qualified paper signal for this digit."])),
+        })
+    data_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="data_intelligence")
+    regime_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="market_regime")
+    return {
+        "snapshot_id":snapshot_id,
+        "created_at":snapshot_timestamp,
+        "symbol":symbol,
+        "currency":settings.currency,
+        "mode":"PAPER_ONLY",
+        "snapshot_consistent":consistent,
+        "snapshot_tick_id":final_tick_id,
+        "latest_tick":final_tick[-1] if final_tick else None,
+        "final_status":decision_data.get("final_status"),
+        "trade_authorized":bool(decision_data.get("trade_authorized")),
+        "signal":approved_signal,
+        "reasons":risk_result["reasons"],
+        "market_status":{
+            "connected":not feed_stale,
+            "data_quality_status":data_agent["status"],
+            "freshness_seconds":data_agent["metrics"].get("latest_tick_age_seconds"),
+            "latest_tick":final_tick[-1] if final_tick else None,
+        },
+        "digits":digit_predictions,
+        "volatility":{
+            "condition":regime_agent["metrics"].get("current_regime"),
+            "health_percent":regime_agent["metrics"].get("volatility_health_percent"),
+            "status":regime_agent["status"],
+        },
+        "agents":coordinated["agents"],
+        "performance":coordinated["performance"],
+        "agent_run_persisted":persisted,
+    }
+
 @app.get("/signals")
 def signals(symbol: str):
     """Current candidate forecasts for inspection only; never a trade authorization."""
@@ -838,6 +1541,258 @@ class Settings:
 
 ---
 
+## `bromax/dashboard.html`
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BROMAX — Market Desk</title>
+<style>
+:root{color-scheme:dark;--bg:#101315;--surface:#171c1e;--surface2:#1d2426;--line:#303a3b;--line2:#263031;--text:#e8eeeb;--muted:#94a19c;--soft:#bac5c0;--green:#83c7a2;--green2:#244c3a;--amber:#d9b675;--amber2:#4a3d26;--red:#d78e88;--red2:#4a2928;--blue:#9ab9c8;--mono:ui-monospace,SFMono-Regular,Consolas,monospace;--sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.48 var(--sans);font-feature-settings:"tnum" 1,"ss01" 1}button,select{font:inherit;color:inherit;background:#202829;border:1px solid var(--line);border-radius:5px;padding:8px 10px}button{cursor:pointer}button:hover{background:#293334;border-color:#52605e}button:focus-visible,select:focus-visible{outline:2px solid var(--green);outline-offset:2px}.topbar{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 26px;background:#14191a;gap:18px}.brand{display:flex;align-items:center;gap:12px}.brandmark{width:28px;height:28px;border:1px solid #648d78;color:var(--green);display:grid;place-items:center;font:700 12px var(--mono);letter-spacing:-1px}.brandname{font-size:14px;font-weight:700;letter-spacing:.13em}.brandname span{color:var(--muted);font-weight:500;letter-spacing:.02em}.topmeta{display:flex;align-items:center;gap:18px;color:var(--muted);font-size:12px}.connection{display:flex;align-items:center;gap:7px}.dot{width:7px;height:7px;border-radius:50%;background:#66716d;display:inline-block}.dot.ok{background:var(--green);box-shadow:0 0 0 3px #83c7a21c}.dot.warn{background:var(--amber)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.toolbar select{min-width:150px}.wrap{max-width:1540px;margin:auto;padding:22px 26px 36px}.pagehead{display:flex;justify-content:space-between;align-items:flex-end;margin:2px 0 18px;gap:18px}.eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);font-weight:650}.pagehead h1{font-size:23px;letter-spacing:-.035em;margin:3px 0 0;font-weight:620}.pagehead p{margin:4px 0 0;color:var(--muted);font-size:12px}.updated{color:var(--muted);font-size:11px;text-align:right}.statusline{border:1px solid var(--line);background:#151b1c;padding:9px 12px;display:flex;align-items:center;gap:10px;margin-bottom:14px;color:var(--soft);font-size:12px}.statusline strong{font-weight:650;color:var(--text)}.layout-main{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(280px,.85fr);gap:14px;align-items:stretch}.panel{background:var(--surface);border:1px solid var(--line);padding:15px 16px;min-width:0}.panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:13px}.paneltitle{font-size:12px;font-weight:680;letter-spacing:.015em}.panelnote{font-size:11px;color:var(--muted)}.signal-panel{min-height:264px;position:relative;display:flex;flex-direction:column}.signal-state{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.12em;font-weight:700;color:var(--amber)}.signal-state.ready{color:var(--green)}.signal-state.rejected{color:var(--red)}.signal-body{display:grid;grid-template-columns:150px minmax(0,1fr);gap:20px;align-items:center;flex:1}.digit-block{border-right:1px solid var(--line);padding:8px 22px 8px 4px}.digit-caption{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.bigdigit{font:500 74px/.95 var(--mono);letter-spacing:-.09em;margin:8px 0;color:var(--soft)}.bigdigit.ready{color:var(--green)}.digit-sub{font-size:11px;color:var(--muted)}.signal-details{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:14px 18px}.detail label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}.detail strong{font:600 14px var(--mono);color:var(--text)}.detail small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.signal-footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line2);padding-top:10px;margin-top:12px;gap:12px;color:var(--muted);font-size:11px}.signal-footer code{font:11px var(--mono);color:var(--soft)}.empty-signal{display:flex;align-items:center;gap:14px;min-height:165px}.empty-icon{width:42px;height:42px;border:1px solid var(--line);display:grid;place-items:center;color:var(--amber);font:18px var(--mono)}.empty-signal h3{font-size:14px;margin:0 0 4px;font-weight:620}.empty-signal p{margin:0;color:var(--muted);max-width:510px;font-size:12px}.side-stack{display:grid;grid-template-rows:1fr 1fr;gap:14px}.marketline{display:flex;justify-content:space-between;align-items:flex-end;margin:8px 0 12px}.price{font:500 25px var(--mono);letter-spacing:-.04em}.lastdigit{font:500 30px var(--mono);color:var(--green)}.microstats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;border-top:1px solid var(--line2);padding-top:11px}.microstats label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.microstats strong{display:block;font:600 13px var(--mono);margin-top:3px}.guard-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line2);font-size:11px}.guard-row:last-child{border:0}.guard-row span{color:var(--muted)}.guard-row strong{font-weight:600;text-align:right}.tag{font-size:9px;letter-spacing:.08em;text-transform:uppercase;padding:3px 6px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}.tag.good{color:var(--green);border-color:#456b55}.tag.warn{color:var(--amber);border-color:#665637}.tag.bad{color:var(--red);border-color:#704441}.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin:14px 0;gap:0;border:1px solid var(--line);background:var(--surface)}.kpi{padding:12px 15px;border-right:1px solid var(--line)}.kpi:last-child{border:0}.kpi label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.09em}.kpi strong{display:block;font:600 20px var(--mono);margin-top:5px;letter-spacing:-.04em}.kpi small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.lower{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1.25fr) minmax(260px,.9fr);gap:14px;align-items:start}.digitrows{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 15px}.digitrow{display:grid;grid-template-columns:16px 1fr 45px;align-items:center;gap:8px;font:11px var(--mono)}.digitrow .n{color:var(--soft)}.track{height:5px;background:#293233;overflow:hidden}.track i{display:block;height:100%;background:#729c83}.digitrow .pct{text-align:right;color:var(--muted)}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th{text-align:left;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;padding:7px 8px;border-bottom:1px solid var(--line)}td{padding:8px;border-bottom:1px solid var(--line2);font-size:11px;color:var(--soft)}td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}tr:last-child td{border-bottom:0}.strategy-name{color:var(--text);font-weight:600}.muted{color:var(--muted)}.activity{display:flex;flex-direction:column}.event{display:grid;grid-template-columns:56px 7px minmax(0,1fr);gap:8px;padding:8px 0;border-bottom:1px solid var(--line2);font-size:11px}.event:last-child{border:0}.event time{font:10px var(--mono);color:var(--muted)}.eventmark{width:6px;height:6px;border-radius:50%;background:#75847d;margin-top:5px}.eventmark.green{background:var(--green)}.eventmark.amber{background:var(--amber)}.eventtext{color:var(--soft)}.eventtext small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.tickstrip{display:flex;gap:6px;flex-wrap:wrap}.tick{border:1px solid var(--line);background:#1b2223;padding:5px 7px;min-width:46px;text-align:center}.tick b{display:block;font:600 14px var(--mono)}.tick small{display:block;color:var(--muted);font:9px var(--mono)}.foot{display:flex;justify-content:space-between;gap:16px;padding:16px 0 0;color:var(--muted);font-size:10px}.mono{font-family:var(--mono)}.hidden{display:none!important}.empty{padding:18px 8px;color:var(--muted);font-size:11px}.right{text-align:right}.positive{color:var(--green)}.negative{color:var(--red)}
+.digit-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}.digit-card{border:1px solid var(--line);background:#151a1b;padding:11px;min-width:0}.digit-card.trade{border-color:#456b55}.digit-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.digit-card-number{font:600 24px var(--mono)}.digit-card-prob{font:600 18px var(--mono);color:var(--soft);margin-top:7px}.digit-card-label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.digit-health{font:600 12px var(--mono)}.health-track{height:4px;background:#293233;margin:5px 0 8px}.health-track i{height:100%;display:block;background:var(--amber)}.digit-card.trade .health-track i{background:var(--green)}.digit-card-meta{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;color:var(--muted);font-size:10px}.digit-card-meta strong{display:block;color:var(--soft);font:11px var(--mono);margin-top:1px}.digit-reason{font-size:10px;color:var(--muted);margin-top:8px;min-height:28px}.health-note{color:var(--muted);font-size:10px;margin:10px 0 0}.scroll-table{overflow:auto;max-height:420px}.compact-table td,.compact-table th{padding:6px 7px}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.metric-box{border:1px solid var(--line2);padding:10px}.metric-box h3{margin:0 0 7px;font-size:11px}.vol-value{font:600 13px var(--mono)}
+@media(max-width:1050px){.lower{grid-template-columns:1fr 1fr}.lower .activity-panel{grid-column:1/-1}.layout-main{grid-template-columns:1fr}.side-stack{grid-template-columns:1fr 1fr;grid-template-rows:auto}.kpis{grid-template-columns:repeat(3,1fr)}.kpi:nth-child(3){border-right:0}.kpi:nth-child(n+4){border-top:1px solid var(--line)}}@media(max-width:680px){.topbar{height:auto;padding:13px 15px;align-items:flex-start;flex-direction:column}.topmeta{width:100%;justify-content:space-between}.wrap{padding:16px 13px 26px}.pagehead{align-items:flex-start;flex-direction:column}.updated{text-align:left}.signal-body{grid-template-columns:90px 1fr;gap:12px}.digit-block{padding-right:12px}.bigdigit{font-size:58px}.signal-details{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.side-stack{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}.kpi:nth-child(2n){border-right:0}.kpi:nth-child(3){border-right:1px solid var(--line)}.kpi:nth-child(n+3){border-top:1px solid var(--line)}.lower{grid-template-columns:1fr}.lower .activity-panel{grid-column:auto}.foot{flex-direction:column}.toolbar{width:100%;justify-content:space-between}.toolbar select{flex:1}}
+</style><style>
+@media(max-width:1100px){.digit-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:680px){.digit-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric-grid{grid-template-columns:1fr}}
+</style></head>
+<body>
+<header class="topbar"><div class="brand"><div class="brandmark">BX</div><div class="brandname">BROMAX <span>/ Market desk</span></div></div><div class="topmeta"><div class="connection"><i class="dot" id="connDot"></i><span id="connText">Checking market feed</span></div><div class="toolbar"><label for="symbol">Market</label><select id="symbol">__SYMBOL_OPTIONS__</select><button id="refreshBtn" type="button">Refresh</button></div></div></header>
+<main class="wrap">
+<div class="pagehead"><div><div class="eyebrow">Deriv synthetic indices · MATCH research</div><h1>Market overview</h1><p>Live market readings, strategy evidence and paper execution in one place.</p></div><div class="updated">Last dashboard update<br><strong id="updatedAt">—</strong></div></div>
+<div class="statusline"><i class="dot" id="statusDot"></i><span><strong id="systemStatus">Starting up</strong> <span id="systemMessage">Waiting for the first market response.</span></span><span class="tag" style="margin-left:auto">PAPER MODE · REAL ORDERS OFF</span></div>
+<section class="layout-main">
+  <article class="panel signal-panel"><div class="panelhead"><div><div class="eyebrow">Execution handoff</div><div class="paneltitle" style="margin-top:3px">Ready to trade</div></div><div id="signalState" class="signal-state"><i class="dot warn"></i> WAITING</div></div>
+    <div id="signalContent" class="empty-signal"><div class="empty-icon">—</div><div><h3>No approved signal</h3><p>BROMAX is monitoring the selected market. A prediction only appears here when its strategy, quote, timing and paper-risk checks all pass.</p></div></div>
+    <div id="signalFooter" class="signal-footer"><span>Signal handoff is inactive until an approved strategy qualifies.</span><code id="signalId">NO SIGNAL</code></div>
+  </article>
+  <div class="side-stack">
+    <article class="panel"><div class="panelhead"><div class="paneltitle">Selected market</div><span class="tag" id="marketTag">—</span></div><div class="marketline"><div><div class="eyebrow">Latest quote</div><div class="price" id="latestPrice">—</div></div><div class="right"><div class="eyebrow">Last digit</div><div class="lastdigit" id="latestDigit">—</div></div></div><div class="microstats"><div><label>Ticks stored</label><strong id="tickCount">—</strong></div><div><label>Last tick time</label><strong id="tickTime">—</strong></div><div><label>Market health</label><strong id="marketHealth">—</strong></div><div><label>Volatility regime</label><strong id="volatilityRegime">—</strong></div></div></article>
+    <article class="panel"><div class="panelhead"><div class="paneltitle">Execution controls</div><span class="tag warn">SIMULATED</span></div><div class="guard-row"><span>Execution mode</span><strong>Paper only</strong></div><div class="guard-row"><span>Configured stake</span><strong id="stakeValue">—</strong></div><div class="guard-row"><span>Daily loss limit</span><strong id="lossLimit">—</strong></div><div class="guard-row"><span>Trades today</span><strong id="tradeCount">—</strong></div><div class="guard-row"><span>Live order endpoint</span><strong class="positive">Disabled</strong></div></article>
+  </div>
+</section>
+<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Digit-by-digit intelligence</div><div class="panelnote">Model probabilities are estimates, not guarantees. Health is an evidence-quality score, not a probability.</div></div><span class="tag warn" id="digitDecisionTag">NO QUALIFIED SIGNAL</span></div><div id="digitCards" class="digit-grid"><div class="empty">Waiting for research evidence.</div></div><p class="health-note" id="healthDefinition">No sample values are shown until forecasts and outcomes have been recorded.</p></section>
+<section class="lower" style="margin-top:14px;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)">
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Per-digit duration analysis</div><div class="panelnote">Observed quote-settled outcomes only · 1–5 ticks</div></div><span class="tag warn">RESEARCH ONLY</span></div><div id="digitDurations" class="scroll-table"><div class="empty">Waiting for quoted paper outcomes.</div></div></article>
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Paper performance breakdown</div><div class="panelnote">Settled ledger outcomes only</div></div><span class="tag">AUDIT DATA</span></div><div id="performanceBreakdown"><div class="empty">No settled paper outcomes are recorded.</div></div></article>
+</section>
+<section class="kpis" aria-label="Paper trading performance"><div class="kpi"><label>Paper trades opened</label><strong id="kpiOpened">—</strong><small>Recorded contracts</small></div><div class="kpi"><label>Settled</label><strong id="kpiSettled">—</strong><small id="kpiPending">— pending</small></div><div class="kpi"><label>Win rate</label><strong id="kpiWinRate">—</strong><small>Settled contracts only</small></div><div class="kpi"><label>Net paper P/L</label><strong id="kpiPnl">—</strong><small>After settled outcomes</small></div><div class="kpi"><label>Latest digit frequency</label><strong id="kpiFreq">—</strong><small>Selected rolling window</small></div></section>
+<section class="lower">
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Digit distribution</div><div class="panelnote">Last <span id="distWindow">1,000</span> ticks · 10% reference</div></div><span class="tag" id="distCount">0 ticks</span></div><div id="distribution" class="empty">Waiting for enough tick history.</div><div class="panelnote" style="margin-top:12px">Observed frequency is descriptive; it does not establish that a digit is more likely on the next tick.</div></article>
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Strategy monitor</div><div class="panelnote">Current candidate forecasts and validation state</div></div><span class="tag">RESEARCH</span></div><div id="strategies" class="tablewrap"><div class="empty">Waiting for strategy output.</div></div></article>
+  <article class="panel activity-panel"><div class="panelhead"><div class="paneltitle">Recent activity</div><span class="panelnote">Newest first</span></div><div id="activity" class="activity"><div class="empty">No events recorded yet.</div></div></article>
+</section>
+<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Timing & volatility research</div><div class="panelnote">1–5 tick horizons · trailing volatility regimes · research only</div></div><span class="tag warn" id="timingTag">NOT VALIDATED</span></div><div id="timingResearch" class="empty">Collecting forecast history for multi-tick analysis.</div><div class="paneltitle" style="margin-top:18px">Actual payout & expected-profit test</div><div class="panelnote">Prospective Deriv proposal quotes matched to their exact future settlement tick</div><div id="payoutTiming" class="empty">Waiting for duration-specific quote and settlement pairs.</div><p class="panelnote" style="margin:10px 0 0">A suggested duration is not an executable setting until duration-specific Deriv quotes, untouched out-of-sample results and forward paper settlements confirm positive expected value. Volatility describes market conditions; it cannot prove a digit.</p></section>
+<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Latest ticks</div><div class="panelnote">Most recent observations received from Deriv</div></div><span class="tag" id="tickFeedTag">NO FEED</span></div><div id="tickTape" class="tickstrip"><div class="empty">Waiting for live ticks.</div></div></section>
+<section class="lower" style="margin-top:14px;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr)">
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Paper execution history</div><div class="panelnote">Only simulated contracts are shown here</div></div><span class="tag">AUDIT LOG</span></div><div id="trades" class="tablewrap"><div class="empty">No paper contracts recorded.</div></div></article>
+  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Research status</div><div class="panelnote">Evidence required before a strategy can be enabled</div></div></div><div id="research" class="empty">Waiting for research report.</div></article>
+</section>
+<div class="foot"><span>BROMAX · Quantitative research and paper execution</span><span>Signals are not guarantees. No strategy is assumed profitable. Real-money trading is not enabled.</span></div>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);const state={symbol:$('symbol').value,last:null};
+const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(Number(v));
+const pct=v=>v==null?'—':(Number(v)*100).toFixed(1)+'%';const nfmt=v=>v==null?'—':Number(v).toLocaleString('en-US');
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(path){const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw new Error(`${r.status} ${r.statusText}`);return r.json()}
+function setText(id,value){$(id).textContent=value??'—'}function fmtTime(epoch){if(!epoch)return'—';return new Date(Number(epoch)*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+function eventTime(value){if(!value)return'—';const d=new Date(value.endsWith('Z')?value:value+'Z');return isNaN(d)?'—':d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+function renderDistribution(d){const counts=d.counts||{};const total=Number(d.n||0);$('distCount').textContent=`${nfmt(total)} ticks`;$('distWindow').textContent=nfmt(d.window||1000);if(!total){$('distribution').innerHTML='<div class="empty">No digit observations have been collected yet.</div>';return}const max=Math.max(1,...Object.values(counts).map(Number));$('distribution').innerHTML='<div class="digitrows">'+Array.from({length:10},(_,i)=>{const c=Number(counts[i]??counts[String(i)]??0);const p=c/total;return `<div class="digitrow"><span class="n">${i}</span><div class="track"><i style="width:${Math.min(100,c/max*100)}%"></i></div><span class="pct">${(p*100).toFixed(1)}%</span></div>`}).join('')+'</div>';$('kpiFreq').textContent=pct(Math.max(...Array.from({length:10},(_,i)=>Number(d.frequencies?.[i]??d.frequencies?.[String(i)]??0))))}
+function renderDigitAnalysis(data){const digits=data?.digits||[];if(digits.length!==10){$('digitCards').innerHTML='<div class="empty">Waiting for complete digit analysis.</div>';return}const candidates=digits.filter(x=>x.decision==='PAPER TRADE CANDIDATE');$('digitDecisionTag').className='tag '+(candidates.length?'good':'warn');$('digitDecisionTag').textContent=candidates.length?`${candidates.length} PAPER CANDIDATE${candidates.length===1?'':'S'}`:'NO QUALIFIED SIGNAL';$('healthDefinition').textContent=data.health_definition||data.note||'Health is an evidence-quality measure, not a probability.';setText('marketHealth',`${nfmt(data.market_health_percent)}%`);setText('volatilityRegime',data.volatility?.regime||'INSUFFICIENT DATA');$('digitCards').innerHTML=digits.map(x=>{const ci=x.confidence_interval_95;const trade=x.decision==='PAPER TRADE CANDIDATE';const reason=x.reasons?.[0]||x.durations?.['1']?.reasons?.[0]||'No per-digit evidence is available.';const health=Math.max(0,Math.min(100,Number(x.health_percent||0)));return `<article class="digit-card ${trade?'trade':''}"><div class="digit-card-head"><span class="digit-card-number">${esc(x.digit)}</span><span class="tag ${trade?'good':'warn'}">${trade?'PAPER TRADE':'DO NOT TRADE'}</span></div><div class="digit-card-label" style="margin-top:7px">Estimated match probability</div><div class="digit-card-prob">${pct(x.estimated_win_probability)}</div><div class="digit-card-head" style="margin-top:8px"><span class="digit-card-label">Evidence health</span><span class="digit-health">${health}%</span></div><div class="health-track"><i style="width:${health}%"></i></div><div class="digit-card-meta"><div>Observed rate<strong>${pct(x.historical_observed_match_rate)}</strong></div><div>95% CI<strong>${ci?`${pct(ci[0])}–${pct(ci[1])}`:'—'}</strong></div><div>Scored samples<strong>${nfmt(x.sample_size)}</strong></div><div>Quoted samples<strong>${nfmt(x.quoted_sample_size)}</strong></div><div>Last 1,000 frequency<strong>${pct(x.current_frequency)}</strong></div><div>Recent 100 frequency<strong>${pct(x.recent_frequency)}</strong></div></div><div class="digit-reason" title="${esc((x.reasons||[]).join(' '))}">${esc(reason)}</div></article>`}).join('');const rows=[];for(const digit of digits){for(const duration of [1,2,3,4,5]){const e=digit.durations?.[String(duration)];const hist=e?.historical||{};const quote=e?.current_quote||{};rows.push(`<tr><td class="num">${digit.digit}</td><td class="num">${duration}t</td><td class="num">${nfmt(hist.n||0)}</td><td class="num">${pct(hist.hit_rate)}</td><td class="num">${money(hist.net_pnl)}</td><td class="num">${quote.available?`${money(quote.payout)} / EV ${money(quote.expected_value)}`:'—'}</td><td><span class="tag warn">${esc(hist.out_of_sample_status||'RESEARCH_ONLY')}</span></td></tr>`)}}$('digitDurations').innerHTML=`<table class="compact-table"><thead><tr><th>Digit</th><th>Duration</th><th>Settled</th><th>Observed hit</th><th>Net paper P/L</th><th>Current quote</th><th>Evidence</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;const perf=data.paper_performance||{};const groups=[['By digit',perf.by_digit||{}],['By strategy',perf.by_strategy||{}]];$('performanceBreakdown').innerHTML=perf.settled_contracts?groups.map(([label,items])=>`<h3 class="paneltitle" style="margin:10px 0 5px">${label}</h3><div class="tablewrap"><table class="compact-table"><thead><tr><th>Group</th><th>Contracts</th><th>Wins</th><th>Win rate</th><th>Net P/L</th></tr></thead><tbody>${Object.entries(items).map(([name,v])=>`<tr><td>${esc(name)}</td><td class="num">${nfmt(v.contracts)}</td><td class="num">${nfmt(v.wins)}</td><td class="num">${pct(v.win_rate)}</td><td class="num">${money(v.net_pnl)}</td></tr>`).join('')}</tbody></table></div>`).join(''):'<div class="empty">No settled paper outcomes are recorded.</div>'}
+function renderSignal(ready,signals,symbol){const sig=ready?.signal||ready?.ready_signal||null;const reason=ready?.reason||ready?.status_reason||'No strategy currently meets every approval and execution condition.';const stateName=ready?.status||'WAITING';const approved=Boolean(sig&&ready?.eligible===true);$('signalState').className='signal-state '+(approved?'ready':stateName==='REJECTED'?'rejected':'');$('signalState').innerHTML=`<i class="dot ${approved?'ok':stateName==='REJECTED'?'warn':''}"></i> ${esc(approved?'READY':stateName)}`;
+ if(!approved){$('signalContent').className='empty-signal';$('signalContent').innerHTML=`<div class="empty-icon">${stateName==='REJECTED'?'!':'—'}</div><div><h3>${stateName==='REJECTED'?'Signal not approved':'No approved signal'}</h3><p>${esc(reason)}</p></div>`;$('signalFooter').innerHTML=`<span>Candidate forecasts remain research-only until every gate passes.</span><code id="signalId">${esc(ready?.signal_id||'NO SIGNAL')}</code>`;return}
+ $('signalContent').className='signal-body';$('signalContent').innerHTML=`<div class="digit-block"><div class="digit-caption">MATCH digit</div><div class="bigdigit ready">${esc(sig.predicted_digit)}</div><div class="digit-sub">${esc(sig.strategy_id||'Approved strategy')}</div></div><div class="signal-details"><div class="detail"><label>Market</label><strong>${esc(sig.symbol||symbol)}</strong></div><div class="detail"><label>Contract</label><strong>DIGITMATCH</strong></div><div class="detail"><label>Duration</label><strong>${esc(sig.duration||1)} tick</strong></div><div class="detail"><label>Paper stake</label><strong>${money(sig.stake)}</strong></div><div class="detail"><label>Win probability</label><strong>${pct(sig.probability)}</strong></div><div class="detail"><label>Quoted payout</label><strong>${money(sig.payout)}</strong></div><div class="detail"><label>Break-even</label><strong>${pct(sig.break_even_probability)}</strong></div><div class="detail"><label>Expected value</label><strong>${money(sig.expected_value)}</strong></div><div class="detail"><label>Signal expires</label><strong>${fmtTime(sig.expires_epoch)}</strong></div></div>`;
+ $('signalFooter').innerHTML=`<span>Approved paper signal · exact forecast passed to simulator</span><code>${esc(sig.signal_id||'—')}</code>`}
+function renderStrategies(data,ready,analysis){const list=analysis?.strategies||[];if(!list.length){$('strategies').innerHTML='<div class="empty">No forecasts yet. The collector needs a full history window before strategies can be evaluated.</div>';return}$('strategies').innerHTML=`<table><thead><tr><th>Strategy</th><th>Digit</th><th>Model p</th><th>Validation n</th><th>Hit rate</th><th>Brier</th><th>Status</th></tr></thead><tbody>${list.map(x=>{const approved=x.explicitly_approved&&x.final_test_status==='evidence_of_edge';return `<tr><td class="strategy-name">${esc(x.strategy_id)}${x.selected?' · selected':''}</td><td class="num">${esc(x.predicted_digit)}</td><td class="num">${pct(x.predicted_digit_probability)}</td><td class="num">${nfmt(x.validation_sample_size)}</td><td class="num">${pct(x.validation_hit_rate)}</td><td class="num">${x.validation_brier==null?'—':Number(x.validation_brier).toFixed(4)}</td><td><span class="tag ${approved?'good':'warn'}" title="${esc(JSON.stringify(x.validation_calibration||[]))}">${approved?'APPROVED':'RESEARCH ONLY'}</span></td></tr>`}).join('')}</tbody></table><div class="panelnote" style="padding:9px 8px 0">Model probability is not a validated win rate. Calibration details are available on each status badge. Ranking alone never authorizes execution.</div>`}
+function renderActivity(trades,signals,health){const ev=[];for(const t of (trades||[]).slice(-8)){ev.push({time:t.created_utc,type:t.event_type==='PAPER_OPEN'?'Paper contract opened':'Paper contract settled',detail:`${t.symbol} · digit ${t.prediction??'—'}${t.paper_pnl!=null?' · P/L '+money(t.paper_pnl):''}`,tone:t.event_type==='PAPER_SETTLE'?'green':'amber'})}for(const e of (health?.recent_errors||[]).slice(-3)){ev.push({time:null,type:'Feed / service notice',detail:e,tone:'amber'})}ev.sort((a,b)=>new Date(b.time||0)-new Date(a.time||0));$('activity').innerHTML=ev.length?ev.slice(0,7).map(e=>`<div class="event"><time>${eventTime(e.time)}</time><i class="eventmark ${e.tone}"></i><div class="eventtext">${esc(e.type)}<small>${esc(e.detail)}</small></div></div>`).join(''):'<div class="empty">No recent events. New forecasts and paper executions will appear here.</div>'}
+function renderTrades(rows){const opens=(rows||[]).filter(x=>x.event_type==='PAPER_OPEN').slice(-8).reverse();if(!opens.length){$('trades').innerHTML='<div class="empty">No paper contracts have been opened. This is normal while strategies remain unapproved.</div>';return}$('trades').innerHTML=`<table><thead><tr><th>Time</th><th>Market</th><th>Digit</th><th>Stake</th><th>Payout</th><th>Outcome</th></tr></thead><tbody>${opens.map(x=>{const settle=(rows||[]).find(y=>y.event_type==='PAPER_SETTLE'&&y.note===String(x.seq));return `<tr><td class="num">${eventTime(x.created_utc)}</td><td>${esc(x.symbol)}</td><td class="num">${esc(x.prediction)}</td><td class="num">${money(x.stake)}</td><td class="num">${money(x.payout)}</td><td>${settle?`<span class="${Number(settle.paper_pnl)>=0?'positive':'negative'}">${Number(settle.hit)?'WIN':'LOSS'} · ${money(settle.paper_pnl)}</span>`:'<span class="muted">OPEN</span>'}</td></tr>`}).join('')}</tbody></table>`}
+function renderPayoutTiming(data){const root=$('payoutTiming');if(!data){root.innerHTML='<div class="empty">Payout test is not available.</div>';return}const best=data.best_candidate;const rows=data.strategies||[];if(!rows.length){root.innerHTML=`<div class="guard-row"><span>Quote-settled pairs</span><strong>${nfmt(data.quote_settled_pairs||0)}</strong></div><div class="empty">${esc(data.note||'Collecting live Deriv proposal quotes and waiting for each duration to settle. Historical ticks cannot recreate past payouts.')}</div>`;return}root.innerHTML=`<div class="guard-row"><span>Quote-settled contracts</span><strong>${nfmt(data.quote_settled_pairs)}</strong></div><div class="guard-row"><span>Best statistically supported duration</span><strong>${best?`${esc(best.duration_ticks)} ticks · ${esc(best.strategy_id)}`:'NONE — evidence insufficient'}</strong></div><div class="guard-row"><span>Execution authorization</span><strong>DISABLED</strong></div><div class="tablewrap"><table><thead><tr><th>Strategy</th><th>Ticks</th><th>Settled</th><th>Net P/L</th><th>Mean return</th><th>Final 95% CI</th><th>Decision</th></tr></thead><tbody>${rows.map(x=>{const f=x.final_test;return `<tr><td>${esc(x.strategy_id)}</td><td class="num">${x.duration_ticks}t</td><td class="num">${nfmt(f?.n||0)}</td><td class="num ${Number(f?.total_pnl||0)>=0?'positive':'negative'}">${money(f?.total_pnl)}</td><td class="num">${pct(f?.mean_return_on_stake)}</td><td class="num">${f?.mean_return_ci95?`${pct(f.mean_return_ci95[0])} to ${pct(f.mean_return_ci95[1])}`:'—'}</td><td><span class="tag ${x.payout_ev_status==='OUT_OF_SAMPLE_PROFIT_EVIDENCE'?'good':'warn'}">${esc(x.payout_ev_status)}</span></td></tr>`}).join('')}</tbody></table></div><p class="panelnote" style="margin-top:10px">Net P/L uses the actual quoted stake and gross payout for each settled contract. Mean return confidence intervals and Holm-adjusted significance are calculated on chronological holdouts. A positive result is evidence, not a promise.</p>`}
+function renderTiming(data){const root=$('timingResearch');const tag=$('timingTag');if(!data||!Array.isArray(data.strategies)||!data.strategies.length){tag.textContent='INSUFFICIENT DATA';root.innerHTML='<div class="empty">Not enough scored forecast history to compare digit hit rates yet.</div>';renderPayoutTiming(data?.payout_optimization);return}const best=data.best_research_candidate;tag.textContent=best?'RESEARCH LEAD · NOT APPROVED':'NO VALIDATED TIMING';root.innerHTML=`<div class="guard-row"><span>Current volatility regime</span><strong>${esc(data.current_volatility_regime||'INSUFFICIENT DATA')}</strong></div><div class="guard-row"><span>Best hit-rate research candidate</span><strong>${best?`${esc(best.duration_ticks)} ticks · ${esc(best.strategy_id)}`:'None'}</strong></div><div class="tablewrap"><table><thead><tr><th>Strategy</th><th>Duration</th><th>Samples</th><th>Hit rate</th><th>95% CI lower</th><th>Status</th></tr></thead><tbody>${data.strategies.map(x=>`<tr><td>${esc(x.strategy_id)}</td><td class="num">${esc(x.duration_ticks)}t</td><td class="num">${nfmt(x.n)}</td><td class="num">${pct(x.hit_rate)}</td><td class="num">${x.hit_rate_ci95?pct(x.hit_rate_ci95[0]):'—'}</td><td><span class="tag warn">${esc(x.timing_status)}</span></td></tr>`).join('')}</tbody></table></div><div class="guard-row"><span>Execution authorization</span><strong>DISABLED</strong></div>`;renderPayoutTiming(data.payout_optimization)}
+function renderResearch(report,symbol){const item=(report?.symbols||[]).find(x=>x.symbol===symbol);if(!item){$('research').textContent='No research report is available for this market yet.';return}const finalists=item.validation_finalists||[];$('research').innerHTML=`<div class="guard-row"><span>Research status</span><strong>${esc(item.status||'In progress')}</strong></div><div class="guard-row"><span>Ticks analyzed</span><strong>${nfmt(item.n_ticks)}</strong></div><div class="guard-row"><span>Validation finalists</span><strong>${finalists.length?nfmt(finalists.length):'None'}</strong></div><div class="guard-row"><span>Final test accessed</span><strong>${item.final_test_accessed?'Yes':'No'}</strong></div><p class="panelnote" style="margin:10px 0 0">A strategy requires frozen out-of-sample evidence and explicit approval before it can generate an execution-ready paper signal.</p>`}
+async function refreshAll(){const symbol=state.symbol;try{const [h,t,d,p,ins,sg,ready,rep,tr,timing,da]=await Promise.all([api('/health'),api(`/ticks/latest?symbol=${encodeURIComponent(symbol)}&limit=12`),api(`/digits/distribution?symbol=${encodeURIComponent(symbol)}&window=1000`),api('/paper/status'),api(`/intelligence?symbol=${encodeURIComponent(symbol)}&window=1000`),api(`/signals?symbol=${encodeURIComponent(symbol)}`),api(`/signals/ready?symbol=${encodeURIComponent(symbol)}`),api('/report'),api(`/paper/trades?symbol=${encodeURIComponent(symbol)}`),api(`/timing?symbol=${encodeURIComponent(symbol)}`),api(`/digits/analysis?symbol=${encodeURIComponent(symbol)}`)]);
+ const stale=Boolean(h.stale?.[symbol]);$('connDot').className='dot '+(!stale?'ok':'warn');setText('connText',stale?'Market feed delayed':'Market feed connected');$('statusDot').className='dot '+(!stale?'ok':'warn');setText('systemStatus',stale?'Feed unavailable or stale':'Market feed operating');setText('systemMessage',stale?'No recent tick received for this symbol. New signals are suspended.':'Analysis and execution checks are running in paper mode.');setText('updatedAt',new Date().toLocaleTimeString());setText('tickCount',nfmt(h.tick_counts?.[symbol]||0));setText('marketTag',symbol);setText('tickFeedTag',t.length?'LIVE TICKS':'NO FEED');if(t.length){const x=t[0];setText('latestPrice',x.quote_text);setText('latestDigit',x.digit);setText('tickTime',fmtTime(x.epoch));$('tickTape').innerHTML=t.slice(0,12).map(x=>`<div class="tick"><b>${esc(x.digit)}</b><small>${fmtTime(x.epoch)}</small></div>`).join('')}else{$('latestPrice').textContent='—';$('latestDigit').textContent='—';$('tickTime').textContent='—';$('tickTape').innerHTML='<div class="empty">No ticks received yet.</div>'}
+ renderDistribution({...d,window:1000});renderDigitAnalysis(da);renderSignal(ready,sg,symbol);renderStrategies(sg,ready,da);setText('stakeValue',money(p.stake));setText('lossLimit',money(p.daily_loss_cap));setText('tradeCount',`${nfmt(p.settled_total||0)} settled / ${nfmt(p.max_trades_per_day||0)} limit`);setText('kpiOpened',nfmt(p.opened_total||0));setText('kpiSettled',nfmt(p.settled_total||0));setText('kpiPending',`${nfmt(p.pending||0)} pending`);const settled=tr.filter(x=>x.event_type==='PAPER_SETTLE');const wins=settled.filter(x=>Number(x.hit)===1).length;setText('kpiWinRate',settled.length?pct(wins/settled.length):'—');const pnl=settled.reduce((a,x)=>a+Number(x.paper_pnl||0),0);setText('kpiPnl',settled.length?money(pnl):'—');$('kpiPnl').className=settled.length?(pnl>=0?'positive':'negative'):'';renderTrades(tr);renderActivity(tr,sg,h);renderResearch(rep,symbol);renderTiming(timing);
+ }catch(e){$('connDot').className='dot warn';setText('connText','Dashboard API unavailable');setText('systemStatus','Unable to refresh');setText('systemMessage',e.message)}}
+$('symbol').addEventListener('change',e=>{state.symbol=e.target.value;refreshAll()});$('refreshBtn').addEventListener('click',refreshAll);refreshAll();setInterval(refreshAll,3000);
+</script></body></html>
+```
+
+---
+
+## `bromax/dashboard_minimal.html`
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BROMAX — Decision Terminal</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
+</style>
+</head>
+<body>
+<header class="topbar"><div class="brand">BROMAX <small> / DECISION TERMINAL · PAPER ONLY</small></div><div class="tools"><select id="symbol" aria-label="Market symbol">__SYMBOL_OPTIONS__</select><a href="/advanced">Advanced analysis</a></div></header>
+<main class="shell">
+  <section class="section" aria-labelledby="market-heading">
+    <div class="section-title"><h2 id="market-heading">Market status</h2><span class="updated" id="updatedAt">Waiting for data</span></div>
+    <div class="market">
+      <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
+      <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
+      <div class="market-item"><span class="label">Latest tick · last digit</span><strong class="value" id="latestTick">—</strong></div>
+      <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
+    </div>
+  </section>
+
+  <section class="section signal" aria-labelledby="signal-heading">
+    <div class="section-title"><h2 id="signal-heading">Best trading signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
+    <div class="signal-grid">
+      <div class="signal-primary"><span class="label">Recommended digit</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
+      <div class="signal-item"><span class="label">Win probability</span><strong class="value" id="signalProbability">—</strong></div>
+      <div class="signal-item"><span class="label">Health</span><strong class="value" id="signalHealth">—</strong></div>
+      <div class="signal-item"><span class="label">Duration</span><strong class="value" id="signalDuration">—</strong></div>
+      <div class="signal-item"><span class="label">Quoted payout</span><strong class="value" id="signalPayout">—</strong></div>
+      <div class="signal-item"><span class="label">Expected value</span><strong class="value" id="signalEv">—</strong></div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="digits-heading">
+    <div class="section-title"><h2 id="digits-heading">Digit prediction · all ten digits</h2><span class="muted" id="decisionNote">Estimates are shown only when calculated.</span></div>
+    <div class="digit-wrap"><table>
+      <thead><tr><th>Digit</th><th>Win probability</th><th>Evidence health</th><th>Decision</th><th>Rejection reason</th></tr></thead>
+      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for research data.</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <div class="bottom">
+    <section class="section" aria-labelledby="volatility-heading">
+      <div class="section-title"><h2 id="volatility-heading">Volatility check</h2></div>
+      <div class="summary-grid">
+        <div><span class="label">Current condition</span><strong class="value" id="volatilityCondition">—</strong></div>
+        <div><span class="label">Volatility health</span><strong class="value" id="volatilityHealth">—</strong></div>
+        <div><span class="label">Signal filter</span><strong class="value" id="volatilityApproval">—</strong></div>
+      </div>
+    </section>
+    <section class="section" aria-labelledby="paper-heading">
+      <div class="section-title"><h2 id="paper-heading">Paper trading results</h2></div>
+      <div class="summary-grid">
+        <div><span class="label">Total trades</span><strong class="value" id="tradeTotal">0</strong></div>
+        <div><span class="label">Wins</span><strong class="value" id="tradeWins">0</strong></div>
+        <div><span class="label">Losses</span><strong class="value" id="tradeLosses">0</strong></div>
+        <div><span class="label">Win rate</span><strong class="value" id="tradeWinRate">—</strong></div>
+        <div><span class="label">Net paper profit</span><strong class="value" id="tradeProfit">—</strong></div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const state={symbol:$('symbol').value,currency:'USD'};
+const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
+const score=value=>value==null||!Number.isFinite(Number(value))?'—':`${Number(value)}%`;
+const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:state.currency,maximumFractionDigits:2}).format(Number(value));
+const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
+function renderMarket(decision){
+  const symbol=decision.symbol,market=decision.market_status||{},tick=market.latest_tick;
+  state.currency=decision.currency||'USD';
+  $('marketSymbol').textContent=symbol;
+  const connected=Boolean(market.connected);
+  const connection=$('connection');connection.className=`status ${connected?'good':'bad'}`;
+  connection.querySelector('span').textContent=connected?'CONNECTED':'STALE / NOT APPROVED';
+  if(tick){
+    const age=market.freshness_seconds;
+    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
+    $('freshness').textContent=`${connected?'FRESH':'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
+    $('freshness').className=`value ${connected?'good-text':'bad-text'}`;
+  }else{
+    $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
+  }
+}
+function renderSignal(decision){
+  const signal=decision?.trade_authorized===true?decision.signal:null;
+  const status=$('signalStatus'),hero=$('signalDigit');
+  if(!signal){
+    status.className='trade-pill no-trade';status.textContent='NO TRADE';
+    hero.className='signal-digit empty';hero.textContent='NO QUALIFIED SIGNAL';
+    for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
+    return;
+  }
+  status.className='trade-pill trade';status.textContent='TRADE · PAPER ONLY';
+  hero.className='signal-digit';hero.textContent=String(signal.predicted_digit);
+  $('signalProbability').textContent=pct(signal.probability);
+  const digit=decision.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit));
+  $('signalHealth').textContent=score(digit?.health_percent);
+  $('signalDuration').textContent=`${signal.duration} tick${Number(signal.duration)===1?'':'s'}`;
+  $('signalPayout').textContent=money(signal.payout);
+  $('signalEv').textContent=money(signal.expected_value);
+}
+function renderDigits(decision){
+  const rows=decision?.digits||[];
+  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>{
+    const row=rows.find(item=>Number(item.digit)===digit);
+    if(!row)return `<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">Research data unavailable.</td></tr>`;
+    const approved=row.decision==='TRADE';
+    const reason=(row.reasons||[]).join(' ');
+    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason||'No qualifying per-digit evidence.')}</td></tr>`;
+  }).join('');
+}
+function renderVolatility(decision){
+  const data=decision?.volatility||{};
+  $('volatilityCondition').textContent=data.condition||'INSUFFICIENT DATA';
+  $('volatilityHealth').textContent=score(data.health_percent);
+  const passed=data.status==='APPROVED';
+  const approval=$('volatilityApproval');
+  approval.textContent=passed?'PASS':data.status==='INSUFFICIENT_EVIDENCE'?'INSUFFICIENT DATA':'FAIL';
+  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT_EVIDENCE'?'warn-text':'bad-text'}`;
+}
+function renderPaper(performance){
+  const total=Number(performance?.paper_opened||0);
+  const wins=Number(performance?.wins||0),losses=Number(performance?.losses||0);
+  const settled=Number(performance?.paper_settled||0),profit=performance?.net_paper_profit;
+  $('tradeTotal').textContent=total.toLocaleString('en-US');
+  $('tradeWins').textContent=String(wins);$('tradeLosses').textContent=String(losses);
+  $('tradeWinRate').textContent=settled?`${(Number(performance.win_rate)*100).toFixed(1)}%`:'—';
+  $('tradeProfit').textContent=profit==null?'—':money(profit);
+  $('tradeProfit').className=`value ${profit==null?'':Number(profit)>=0?'good-text':'bad-text'}`;
+}
+function renderUnavailable(error){
+  const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
+  $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
+  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
+  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
+  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval','tradeTotal','tradeWins','tradeLosses','tradeWinRate','tradeProfit'])$(id).textContent='—';
+  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>`<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">API unavailable: ${safe(error.message)}</td></tr>`).join('');
+}
+async function refresh(){
+  try{
+    const decision=await api(`/decision?symbol=${encodeURIComponent(state.symbol)}`);
+    renderMarket(decision);
+    renderSignal(decision);
+    renderDigits(decision);
+    renderVolatility(decision);
+    renderPaper(decision.performance);
+    $('updatedAt').textContent=`Updated ${new Date(decision.created_at).toLocaleTimeString()}`;
+  }catch(error){
+    renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
+  }
+}
+$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh()});
+refresh();setInterval(refresh,3000);
+</script>
+</body>
+</html>
+```
+
+---
+
 ## `bromax/desktop.py`
 
 ```python
@@ -921,13 +1876,9 @@ class AnalysisPanel:
             token=base64.b64encode(f"{self.username}:{self.password}".encode("utf-8")).decode("ascii")
             headers["Authorization"]=f"Basic {token}"
         symbol=urllib.parse.quote(self.symbol)
-        data={}
-        for key,path in (("analysis",f"/digits/analysis?symbol={symbol}"),
-                         ("ready",f"/signals/ready?symbol={symbol}")):
-            request=urllib.request.Request(f"{self.base_url}{path}",headers=headers)
-            with urllib.request.urlopen(request,timeout=5) as response:
-                data[key]=json.loads(response.read().decode("utf-8"))
-        return data
+        request=urllib.request.Request(f"{self.base_url}/decision?symbol={symbol}",headers=headers)
+        with urllib.request.urlopen(request,timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def refresh(self):
         if self.request_in_progress:
@@ -976,29 +1927,24 @@ class AnalysisPanel:
             self.root.after(50,self.refresh)
 
     def _render(self,data):
-        analysis=data["analysis"]
-        ready=data["ready"]
-        signal=ready.get("signal") if ready.get("eligible") is True else None
-        digit_row=next((row for row in analysis.get("digits",[])
+        signal=data.get("signal") if data.get("trade_authorized") is True else None
+        digit_row=next((row for row in data.get("digits",[])
                         if signal and int(row.get("digit",-1))==int(signal.get("predicted_digit",-2))),None)
-        duration_row=(digit_row or {}).get("durations",{}).get(str(signal.get("duration",1))) if signal else None
-        qualified=bool(signal and digit_row and digit_row.get("decision")=="PAPER TRADE CANDIDATE"
-                       and duration_row and duration_row.get("decision")=="PAPER TRADE CANDIDATE")
+        qualified=bool(signal and digit_row and digit_row.get("decision")=="TRADE")
+        volatility=data.get("volatility") or {}
         if not qualified:
-            volatility=analysis.get("volatility_filter") or {}
             for key in ("probability","health","duration"):
                 self.fields[key].configure(text="—")
             self.fields["digit"].configure(text="NO QUALIFIED SIGNAL")
-            self.fields["volatility"].configure(text=volatility.get("status","INSUFFICIENT DATA"))
+            self.fields["volatility"].configure(text=volatility.get("status","INSUFFICIENT_EVIDENCE"))
             self.fields["status"].configure(text="NO TRADE",foreground="#d78e88")
             return
-        volatility=analysis.get("volatility_filter") or {}
         self.fields["digit"].configure(text=str(signal["predicted_digit"]))
         self.fields["probability"].configure(text=f"{float(signal['probability'])*100:.1f}%")
         health=digit_row.get("health_percent")
         self.fields["health"].configure(text=f"{health}%" if health is not None else "—")
         self.fields["duration"].configure(text=f"{signal['duration']} tick(s)")
-        self.fields["volatility"].configure(text="PASS" if volatility.get("status")=="PASS" else "FAIL")
+        self.fields["volatility"].configure(text="PASS" if volatility.get("status")=="APPROVED" else "FAIL")
         self.fields["status"].configure(text="TRADE · PAPER ONLY",foreground="#85d2a3")
 
     def _render_unavailable(self,status):
@@ -1843,6 +2789,14 @@ CREATE TABLE IF NOT EXISTS research_snapshots_v2(
 );
 CREATE TRIGGER IF NOT EXISTS research_snapshots_v2_no_update BEFORE UPDATE ON research_snapshots_v2 BEGIN SELECT RAISE(ABORT,'versioned research snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS research_snapshots_v2_no_delete BEFORE DELETE ON research_snapshots_v2 BEGIN SELECT RAISE(ABORT,'versioned research snapshots are immutable'); END;
+CREATE TABLE IF NOT EXISTS agent_runs(
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_id TEXT NOT NULL UNIQUE,
+ created_utc TEXT NOT NULL, symbol TEXT NOT NULL, snapshot_tick_id INTEGER,
+ final_status TEXT NOT NULL, decision_key TEXT NOT NULL, agent_results_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_symbol_seq ON agent_runs(symbol,seq);
+CREATE TRIGGER IF NOT EXISTS agent_runs_no_update BEFORE UPDATE ON agent_runs BEGIN SELECT RAISE(ABORT,'agent runs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS agent_runs_no_delete BEFORE DELETE ON agent_runs BEGIN SELECT RAISE(ABORT,'agent runs are immutable'); END;
 CREATE TABLE IF NOT EXISTS audit_events(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
  event_type TEXT NOT NULL CHECK(event_type IN ('FORECAST','SCORE','QUOTE','PAPER_OPEN','PAPER_SETTLE')),
@@ -2050,6 +3004,47 @@ class Store:
             if symbol: q += " AND symbol=?"; args=(symbol,)
             q += " ORDER BY seq"
             return [dict(r) for r in c.execute(q,args).fetchall()]
+
+    def quality_history(self, symbol, limit=20):
+        with self.connect() as c:
+            rows=c.execute(
+                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",
+                (symbol,max(1,int(limit))),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def record_agent_run(self, snapshot_id, symbol, snapshot_tick_id, final_status, decision_key, agent_results, minimum_interval_seconds=60):
+        now=datetime.now(timezone.utc)
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            latest=c.execute(
+                "SELECT created_utc,final_status,decision_key FROM agent_runs WHERE symbol=? ORDER BY seq DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if latest and latest["final_status"]==final_status and latest["decision_key"]==decision_key:
+                previous=datetime.fromisoformat(latest["created_utc"])
+                if (now-previous).total_seconds()<minimum_interval_seconds:
+                    return False
+            c.execute(
+                "INSERT INTO agent_runs(snapshot_id,created_utc,symbol,snapshot_tick_id,final_status,decision_key,agent_results_json) VALUES(?,?,?,?,?,?,?)",
+                (snapshot_id,now.isoformat(),symbol,snapshot_tick_id,final_status,decision_key,json.dumps(agent_results,separators=(",",":"),default=str)),
+            )
+            return True
+
+    def agent_runs(self, symbol, limit=20):
+        with self.connect() as c:
+            rows=c.execute(
+                "SELECT seq,snapshot_id,created_utc,symbol,snapshot_tick_id,final_status,decision_key,agent_results_json "
+                "FROM agent_runs WHERE symbol=? ORDER BY seq DESC LIMIT ?",
+                (symbol,max(1,int(limit))),
+            ).fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            item["agent_results"]=json.loads(item.pop("agent_results_json"))
+            result.append(item)
+        return result
+
     def ticks_frame(self, symbol):
         import pandas as pd
         with self.connect() as c:
@@ -2442,267 +3437,105 @@ def evaluate_payout_timing(duration_events, min_holdout=5000):
 
 ---
 
-## `bromax/dashboard.html`
+## `tests/test_agents.py`
 
-```html
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BROMAX — Market Desk</title>
-<style>
-:root{color-scheme:dark;--bg:#101315;--surface:#171c1e;--surface2:#1d2426;--line:#303a3b;--line2:#263031;--text:#e8eeeb;--muted:#94a19c;--soft:#bac5c0;--green:#83c7a2;--green2:#244c3a;--amber:#d9b675;--amber2:#4a3d26;--red:#d78e88;--red2:#4a2928;--blue:#9ab9c8;--mono:ui-monospace,SFMono-Regular,Consolas,monospace;--sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.48 var(--sans);font-feature-settings:"tnum" 1,"ss01" 1}button,select{font:inherit;color:inherit;background:#202829;border:1px solid var(--line);border-radius:5px;padding:8px 10px}button{cursor:pointer}button:hover{background:#293334;border-color:#52605e}button:focus-visible,select:focus-visible{outline:2px solid var(--green);outline-offset:2px}.topbar{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 26px;background:#14191a;gap:18px}.brand{display:flex;align-items:center;gap:12px}.brandmark{width:28px;height:28px;border:1px solid #648d78;color:var(--green);display:grid;place-items:center;font:700 12px var(--mono);letter-spacing:-1px}.brandname{font-size:14px;font-weight:700;letter-spacing:.13em}.brandname span{color:var(--muted);font-weight:500;letter-spacing:.02em}.topmeta{display:flex;align-items:center;gap:18px;color:var(--muted);font-size:12px}.connection{display:flex;align-items:center;gap:7px}.dot{width:7px;height:7px;border-radius:50%;background:#66716d;display:inline-block}.dot.ok{background:var(--green);box-shadow:0 0 0 3px #83c7a21c}.dot.warn{background:var(--amber)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.toolbar select{min-width:150px}.wrap{max-width:1540px;margin:auto;padding:22px 26px 36px}.pagehead{display:flex;justify-content:space-between;align-items:flex-end;margin:2px 0 18px;gap:18px}.eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);font-weight:650}.pagehead h1{font-size:23px;letter-spacing:-.035em;margin:3px 0 0;font-weight:620}.pagehead p{margin:4px 0 0;color:var(--muted);font-size:12px}.updated{color:var(--muted);font-size:11px;text-align:right}.statusline{border:1px solid var(--line);background:#151b1c;padding:9px 12px;display:flex;align-items:center;gap:10px;margin-bottom:14px;color:var(--soft);font-size:12px}.statusline strong{font-weight:650;color:var(--text)}.layout-main{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(280px,.85fr);gap:14px;align-items:stretch}.panel{background:var(--surface);border:1px solid var(--line);padding:15px 16px;min-width:0}.panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:13px}.paneltitle{font-size:12px;font-weight:680;letter-spacing:.015em}.panelnote{font-size:11px;color:var(--muted)}.signal-panel{min-height:264px;position:relative;display:flex;flex-direction:column}.signal-state{display:flex;align-items:center;gap:8px;font-size:10px;letter-spacing:.12em;font-weight:700;color:var(--amber)}.signal-state.ready{color:var(--green)}.signal-state.rejected{color:var(--red)}.signal-body{display:grid;grid-template-columns:150px minmax(0,1fr);gap:20px;align-items:center;flex:1}.digit-block{border-right:1px solid var(--line);padding:8px 22px 8px 4px}.digit-caption{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.bigdigit{font:500 74px/.95 var(--mono);letter-spacing:-.09em;margin:8px 0;color:var(--soft)}.bigdigit.ready{color:var(--green)}.digit-sub{font-size:11px;color:var(--muted)}.signal-details{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:14px 18px}.detail label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}.detail strong{font:600 14px var(--mono);color:var(--text)}.detail small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.signal-footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line2);padding-top:10px;margin-top:12px;gap:12px;color:var(--muted);font-size:11px}.signal-footer code{font:11px var(--mono);color:var(--soft)}.empty-signal{display:flex;align-items:center;gap:14px;min-height:165px}.empty-icon{width:42px;height:42px;border:1px solid var(--line);display:grid;place-items:center;color:var(--amber);font:18px var(--mono)}.empty-signal h3{font-size:14px;margin:0 0 4px;font-weight:620}.empty-signal p{margin:0;color:var(--muted);max-width:510px;font-size:12px}.side-stack{display:grid;grid-template-rows:1fr 1fr;gap:14px}.marketline{display:flex;justify-content:space-between;align-items:flex-end;margin:8px 0 12px}.price{font:500 25px var(--mono);letter-spacing:-.04em}.lastdigit{font:500 30px var(--mono);color:var(--green)}.microstats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;border-top:1px solid var(--line2);padding-top:11px}.microstats label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.microstats strong{display:block;font:600 13px var(--mono);margin-top:3px}.guard-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line2);font-size:11px}.guard-row:last-child{border:0}.guard-row span{color:var(--muted)}.guard-row strong{font-weight:600;text-align:right}.tag{font-size:9px;letter-spacing:.08em;text-transform:uppercase;padding:3px 6px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}.tag.good{color:var(--green);border-color:#456b55}.tag.warn{color:var(--amber);border-color:#665637}.tag.bad{color:var(--red);border-color:#704441}.kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin:14px 0;gap:0;border:1px solid var(--line);background:var(--surface)}.kpi{padding:12px 15px;border-right:1px solid var(--line)}.kpi:last-child{border:0}.kpi label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.09em}.kpi strong{display:block;font:600 20px var(--mono);margin-top:5px;letter-spacing:-.04em}.kpi small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.lower{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1.25fr) minmax(260px,.9fr);gap:14px;align-items:start}.digitrows{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 15px}.digitrow{display:grid;grid-template-columns:16px 1fr 45px;align-items:center;gap:8px;font:11px var(--mono)}.digitrow .n{color:var(--soft)}.track{height:5px;background:#293233;overflow:hidden}.track i{display:block;height:100%;background:#729c83}.digitrow .pct{text-align:right;color:var(--muted)}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th{text-align:left;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;padding:7px 8px;border-bottom:1px solid var(--line)}td{padding:8px;border-bottom:1px solid var(--line2);font-size:11px;color:var(--soft)}td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}tr:last-child td{border-bottom:0}.strategy-name{color:var(--text);font-weight:600}.muted{color:var(--muted)}.activity{display:flex;flex-direction:column}.event{display:grid;grid-template-columns:56px 7px minmax(0,1fr);gap:8px;padding:8px 0;border-bottom:1px solid var(--line2);font-size:11px}.event:last-child{border:0}.event time{font:10px var(--mono);color:var(--muted)}.eventmark{width:6px;height:6px;border-radius:50%;background:#75847d;margin-top:5px}.eventmark.green{background:var(--green)}.eventmark.amber{background:var(--amber)}.eventtext{color:var(--soft)}.eventtext small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.tickstrip{display:flex;gap:6px;flex-wrap:wrap}.tick{border:1px solid var(--line);background:#1b2223;padding:5px 7px;min-width:46px;text-align:center}.tick b{display:block;font:600 14px var(--mono)}.tick small{display:block;color:var(--muted);font:9px var(--mono)}.foot{display:flex;justify-content:space-between;gap:16px;padding:16px 0 0;color:var(--muted);font-size:10px}.mono{font-family:var(--mono)}.hidden{display:none!important}.empty{padding:18px 8px;color:var(--muted);font-size:11px}.right{text-align:right}.positive{color:var(--green)}.negative{color:var(--red)}
-.digit-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}.digit-card{border:1px solid var(--line);background:#151a1b;padding:11px;min-width:0}.digit-card.trade{border-color:#456b55}.digit-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.digit-card-number{font:600 24px var(--mono)}.digit-card-prob{font:600 18px var(--mono);color:var(--soft);margin-top:7px}.digit-card-label{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.digit-health{font:600 12px var(--mono)}.health-track{height:4px;background:#293233;margin:5px 0 8px}.health-track i{height:100%;display:block;background:var(--amber)}.digit-card.trade .health-track i{background:var(--green)}.digit-card-meta{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;color:var(--muted);font-size:10px}.digit-card-meta strong{display:block;color:var(--soft);font:11px var(--mono);margin-top:1px}.digit-reason{font-size:10px;color:var(--muted);margin-top:8px;min-height:28px}.health-note{color:var(--muted);font-size:10px;margin:10px 0 0}.scroll-table{overflow:auto;max-height:420px}.compact-table td,.compact-table th{padding:6px 7px}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.metric-box{border:1px solid var(--line2);padding:10px}.metric-box h3{margin:0 0 7px;font-size:11px}.vol-value{font:600 13px var(--mono)}
-@media(max-width:1050px){.lower{grid-template-columns:1fr 1fr}.lower .activity-panel{grid-column:1/-1}.layout-main{grid-template-columns:1fr}.side-stack{grid-template-columns:1fr 1fr;grid-template-rows:auto}.kpis{grid-template-columns:repeat(3,1fr)}.kpi:nth-child(3){border-right:0}.kpi:nth-child(n+4){border-top:1px solid var(--line)}}@media(max-width:680px){.topbar{height:auto;padding:13px 15px;align-items:flex-start;flex-direction:column}.topmeta{width:100%;justify-content:space-between}.wrap{padding:16px 13px 26px}.pagehead{align-items:flex-start;flex-direction:column}.updated{text-align:left}.signal-body{grid-template-columns:90px 1fr;gap:12px}.digit-block{padding-right:12px}.bigdigit{font-size:58px}.signal-details{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.side-stack{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}.kpi:nth-child(2n){border-right:0}.kpi:nth-child(3){border-right:1px solid var(--line)}.kpi:nth-child(n+3){border-top:1px solid var(--line)}.lower{grid-template-columns:1fr}.lower .activity-panel{grid-column:auto}.foot{flex-direction:column}.toolbar{width:100%;justify-content:space-between}.toolbar select{flex:1}}
-</style><style>
-@media(max-width:1100px){.digit-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:680px){.digit-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric-grid{grid-template-columns:1fr}}
-</style></head>
-<body>
-<header class="topbar"><div class="brand"><div class="brandmark">BX</div><div class="brandname">BROMAX <span>/ Market desk</span></div></div><div class="topmeta"><div class="connection"><i class="dot" id="connDot"></i><span id="connText">Checking market feed</span></div><div class="toolbar"><label for="symbol">Market</label><select id="symbol">__SYMBOL_OPTIONS__</select><button id="refreshBtn" type="button">Refresh</button></div></div></header>
-<main class="wrap">
-<div class="pagehead"><div><div class="eyebrow">Deriv synthetic indices · MATCH research</div><h1>Market overview</h1><p>Live market readings, strategy evidence and paper execution in one place.</p></div><div class="updated">Last dashboard update<br><strong id="updatedAt">—</strong></div></div>
-<div class="statusline"><i class="dot" id="statusDot"></i><span><strong id="systemStatus">Starting up</strong> <span id="systemMessage">Waiting for the first market response.</span></span><span class="tag" style="margin-left:auto">PAPER MODE · REAL ORDERS OFF</span></div>
-<section class="layout-main">
-  <article class="panel signal-panel"><div class="panelhead"><div><div class="eyebrow">Execution handoff</div><div class="paneltitle" style="margin-top:3px">Ready to trade</div></div><div id="signalState" class="signal-state"><i class="dot warn"></i> WAITING</div></div>
-    <div id="signalContent" class="empty-signal"><div class="empty-icon">—</div><div><h3>No approved signal</h3><p>BROMAX is monitoring the selected market. A prediction only appears here when its strategy, quote, timing and paper-risk checks all pass.</p></div></div>
-    <div id="signalFooter" class="signal-footer"><span>Signal handoff is inactive until an approved strategy qualifies.</span><code id="signalId">NO SIGNAL</code></div>
-  </article>
-  <div class="side-stack">
-    <article class="panel"><div class="panelhead"><div class="paneltitle">Selected market</div><span class="tag" id="marketTag">—</span></div><div class="marketline"><div><div class="eyebrow">Latest quote</div><div class="price" id="latestPrice">—</div></div><div class="right"><div class="eyebrow">Last digit</div><div class="lastdigit" id="latestDigit">—</div></div></div><div class="microstats"><div><label>Ticks stored</label><strong id="tickCount">—</strong></div><div><label>Last tick time</label><strong id="tickTime">—</strong></div><div><label>Market health</label><strong id="marketHealth">—</strong></div><div><label>Volatility regime</label><strong id="volatilityRegime">—</strong></div></div></article>
-    <article class="panel"><div class="panelhead"><div class="paneltitle">Execution controls</div><span class="tag warn">SIMULATED</span></div><div class="guard-row"><span>Execution mode</span><strong>Paper only</strong></div><div class="guard-row"><span>Configured stake</span><strong id="stakeValue">—</strong></div><div class="guard-row"><span>Daily loss limit</span><strong id="lossLimit">—</strong></div><div class="guard-row"><span>Trades today</span><strong id="tradeCount">—</strong></div><div class="guard-row"><span>Live order endpoint</span><strong class="positive">Disabled</strong></div></article>
-  </div>
-</section>
-<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Digit-by-digit intelligence</div><div class="panelnote">Model probabilities are estimates, not guarantees. Health is an evidence-quality score, not a probability.</div></div><span class="tag warn" id="digitDecisionTag">NO QUALIFIED SIGNAL</span></div><div id="digitCards" class="digit-grid"><div class="empty">Waiting for research evidence.</div></div><p class="health-note" id="healthDefinition">No sample values are shown until forecasts and outcomes have been recorded.</p></section>
-<section class="lower" style="margin-top:14px;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)">
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Per-digit duration analysis</div><div class="panelnote">Observed quote-settled outcomes only · 1–5 ticks</div></div><span class="tag warn">RESEARCH ONLY</span></div><div id="digitDurations" class="scroll-table"><div class="empty">Waiting for quoted paper outcomes.</div></div></article>
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Paper performance breakdown</div><div class="panelnote">Settled ledger outcomes only</div></div><span class="tag">AUDIT DATA</span></div><div id="performanceBreakdown"><div class="empty">No settled paper outcomes are recorded.</div></div></article>
-</section>
-<section class="kpis" aria-label="Paper trading performance"><div class="kpi"><label>Paper trades opened</label><strong id="kpiOpened">—</strong><small>Recorded contracts</small></div><div class="kpi"><label>Settled</label><strong id="kpiSettled">—</strong><small id="kpiPending">— pending</small></div><div class="kpi"><label>Win rate</label><strong id="kpiWinRate">—</strong><small>Settled contracts only</small></div><div class="kpi"><label>Net paper P/L</label><strong id="kpiPnl">—</strong><small>After settled outcomes</small></div><div class="kpi"><label>Latest digit frequency</label><strong id="kpiFreq">—</strong><small>Selected rolling window</small></div></section>
-<section class="lower">
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Digit distribution</div><div class="panelnote">Last <span id="distWindow">1,000</span> ticks · 10% reference</div></div><span class="tag" id="distCount">0 ticks</span></div><div id="distribution" class="empty">Waiting for enough tick history.</div><div class="panelnote" style="margin-top:12px">Observed frequency is descriptive; it does not establish that a digit is more likely on the next tick.</div></article>
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Strategy monitor</div><div class="panelnote">Current candidate forecasts and validation state</div></div><span class="tag">RESEARCH</span></div><div id="strategies" class="tablewrap"><div class="empty">Waiting for strategy output.</div></div></article>
-  <article class="panel activity-panel"><div class="panelhead"><div class="paneltitle">Recent activity</div><span class="panelnote">Newest first</span></div><div id="activity" class="activity"><div class="empty">No events recorded yet.</div></div></article>
-</section>
-<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Timing & volatility research</div><div class="panelnote">1–5 tick horizons · trailing volatility regimes · research only</div></div><span class="tag warn" id="timingTag">NOT VALIDATED</span></div><div id="timingResearch" class="empty">Collecting forecast history for multi-tick analysis.</div><div class="paneltitle" style="margin-top:18px">Actual payout & expected-profit test</div><div class="panelnote">Prospective Deriv proposal quotes matched to their exact future settlement tick</div><div id="payoutTiming" class="empty">Waiting for duration-specific quote and settlement pairs.</div><p class="panelnote" style="margin:10px 0 0">A suggested duration is not an executable setting until duration-specific Deriv quotes, untouched out-of-sample results and forward paper settlements confirm positive expected value. Volatility describes market conditions; it cannot prove a digit.</p></section>
-<section class="panel" style="margin-top:14px"><div class="panelhead"><div><div class="paneltitle">Latest ticks</div><div class="panelnote">Most recent observations received from Deriv</div></div><span class="tag" id="tickFeedTag">NO FEED</span></div><div id="tickTape" class="tickstrip"><div class="empty">Waiting for live ticks.</div></div></section>
-<section class="lower" style="margin-top:14px;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr)">
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Paper execution history</div><div class="panelnote">Only simulated contracts are shown here</div></div><span class="tag">AUDIT LOG</span></div><div id="trades" class="tablewrap"><div class="empty">No paper contracts recorded.</div></div></article>
-  <article class="panel"><div class="panelhead"><div><div class="paneltitle">Research status</div><div class="panelnote">Evidence required before a strategy can be enabled</div></div></div><div id="research" class="empty">Waiting for research report.</div></article>
-</section>
-<div class="foot"><span>BROMAX · Quantitative research and paper execution</span><span>Signals are not guarantees. No strategy is assumed profitable. Real-money trading is not enabled.</span></div>
-</main>
-<script>
-'use strict';
-const $=id=>document.getElementById(id);const state={symbol:$('symbol').value,last:null};
-const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(Number(v));
-const pct=v=>v==null?'—':(Number(v)*100).toFixed(1)+'%';const nfmt=v=>v==null?'—':Number(v).toLocaleString('en-US');
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path){const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw new Error(`${r.status} ${r.statusText}`);return r.json()}
-function setText(id,value){$(id).textContent=value??'—'}function fmtTime(epoch){if(!epoch)return'—';return new Date(Number(epoch)*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
-function eventTime(value){if(!value)return'—';const d=new Date(value.endsWith('Z')?value:value+'Z');return isNaN(d)?'—':d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
-function renderDistribution(d){const counts=d.counts||{};const total=Number(d.n||0);$('distCount').textContent=`${nfmt(total)} ticks`;$('distWindow').textContent=nfmt(d.window||1000);if(!total){$('distribution').innerHTML='<div class="empty">No digit observations have been collected yet.</div>';return}const max=Math.max(1,...Object.values(counts).map(Number));$('distribution').innerHTML='<div class="digitrows">'+Array.from({length:10},(_,i)=>{const c=Number(counts[i]??counts[String(i)]??0);const p=c/total;return `<div class="digitrow"><span class="n">${i}</span><div class="track"><i style="width:${Math.min(100,c/max*100)}%"></i></div><span class="pct">${(p*100).toFixed(1)}%</span></div>`}).join('')+'</div>';$('kpiFreq').textContent=pct(Math.max(...Array.from({length:10},(_,i)=>Number(d.frequencies?.[i]??d.frequencies?.[String(i)]??0))))}
-function renderDigitAnalysis(data){const digits=data?.digits||[];if(digits.length!==10){$('digitCards').innerHTML='<div class="empty">Waiting for complete digit analysis.</div>';return}const candidates=digits.filter(x=>x.decision==='PAPER TRADE CANDIDATE');$('digitDecisionTag').className='tag '+(candidates.length?'good':'warn');$('digitDecisionTag').textContent=candidates.length?`${candidates.length} PAPER CANDIDATE${candidates.length===1?'':'S'}`:'NO QUALIFIED SIGNAL';$('healthDefinition').textContent=data.health_definition||data.note||'Health is an evidence-quality measure, not a probability.';setText('marketHealth',`${nfmt(data.market_health_percent)}%`);setText('volatilityRegime',data.volatility?.regime||'INSUFFICIENT DATA');$('digitCards').innerHTML=digits.map(x=>{const ci=x.confidence_interval_95;const trade=x.decision==='PAPER TRADE CANDIDATE';const reason=x.reasons?.[0]||x.durations?.['1']?.reasons?.[0]||'No per-digit evidence is available.';const health=Math.max(0,Math.min(100,Number(x.health_percent||0)));return `<article class="digit-card ${trade?'trade':''}"><div class="digit-card-head"><span class="digit-card-number">${esc(x.digit)}</span><span class="tag ${trade?'good':'warn'}">${trade?'PAPER TRADE':'DO NOT TRADE'}</span></div><div class="digit-card-label" style="margin-top:7px">Estimated match probability</div><div class="digit-card-prob">${pct(x.estimated_win_probability)}</div><div class="digit-card-head" style="margin-top:8px"><span class="digit-card-label">Evidence health</span><span class="digit-health">${health}%</span></div><div class="health-track"><i style="width:${health}%"></i></div><div class="digit-card-meta"><div>Observed rate<strong>${pct(x.historical_observed_match_rate)}</strong></div><div>95% CI<strong>${ci?`${pct(ci[0])}–${pct(ci[1])}`:'—'}</strong></div><div>Scored samples<strong>${nfmt(x.sample_size)}</strong></div><div>Quoted samples<strong>${nfmt(x.quoted_sample_size)}</strong></div><div>Last 1,000 frequency<strong>${pct(x.current_frequency)}</strong></div><div>Recent 100 frequency<strong>${pct(x.recent_frequency)}</strong></div></div><div class="digit-reason" title="${esc((x.reasons||[]).join(' '))}">${esc(reason)}</div></article>`}).join('');const rows=[];for(const digit of digits){for(const duration of [1,2,3,4,5]){const e=digit.durations?.[String(duration)];const hist=e?.historical||{};const quote=e?.current_quote||{};rows.push(`<tr><td class="num">${digit.digit}</td><td class="num">${duration}t</td><td class="num">${nfmt(hist.n||0)}</td><td class="num">${pct(hist.hit_rate)}</td><td class="num">${money(hist.net_pnl)}</td><td class="num">${quote.available?`${money(quote.payout)} / EV ${money(quote.expected_value)}`:'—'}</td><td><span class="tag warn">${esc(hist.out_of_sample_status||'RESEARCH_ONLY')}</span></td></tr>`)}}$('digitDurations').innerHTML=`<table class="compact-table"><thead><tr><th>Digit</th><th>Duration</th><th>Settled</th><th>Observed hit</th><th>Net paper P/L</th><th>Current quote</th><th>Evidence</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;const perf=data.paper_performance||{};const groups=[['By digit',perf.by_digit||{}],['By strategy',perf.by_strategy||{}]];$('performanceBreakdown').innerHTML=perf.settled_contracts?groups.map(([label,items])=>`<h3 class="paneltitle" style="margin:10px 0 5px">${label}</h3><div class="tablewrap"><table class="compact-table"><thead><tr><th>Group</th><th>Contracts</th><th>Wins</th><th>Win rate</th><th>Net P/L</th></tr></thead><tbody>${Object.entries(items).map(([name,v])=>`<tr><td>${esc(name)}</td><td class="num">${nfmt(v.contracts)}</td><td class="num">${nfmt(v.wins)}</td><td class="num">${pct(v.win_rate)}</td><td class="num">${money(v.net_pnl)}</td></tr>`).join('')}</tbody></table></div>`).join(''):'<div class="empty">No settled paper outcomes are recorded.</div>'}
-function renderSignal(ready,signals,symbol){const sig=ready?.signal||ready?.ready_signal||null;const reason=ready?.reason||ready?.status_reason||'No strategy currently meets every approval and execution condition.';const stateName=ready?.status||'WAITING';const approved=Boolean(sig&&ready?.eligible===true);$('signalState').className='signal-state '+(approved?'ready':stateName==='REJECTED'?'rejected':'');$('signalState').innerHTML=`<i class="dot ${approved?'ok':stateName==='REJECTED'?'warn':''}"></i> ${esc(approved?'READY':stateName)}`;
- if(!approved){$('signalContent').className='empty-signal';$('signalContent').innerHTML=`<div class="empty-icon">${stateName==='REJECTED'?'!':'—'}</div><div><h3>${stateName==='REJECTED'?'Signal not approved':'No approved signal'}</h3><p>${esc(reason)}</p></div>`;$('signalFooter').innerHTML=`<span>Candidate forecasts remain research-only until every gate passes.</span><code id="signalId">${esc(ready?.signal_id||'NO SIGNAL')}</code>`;return}
- $('signalContent').className='signal-body';$('signalContent').innerHTML=`<div class="digit-block"><div class="digit-caption">MATCH digit</div><div class="bigdigit ready">${esc(sig.predicted_digit)}</div><div class="digit-sub">${esc(sig.strategy_id||'Approved strategy')}</div></div><div class="signal-details"><div class="detail"><label>Market</label><strong>${esc(sig.symbol||symbol)}</strong></div><div class="detail"><label>Contract</label><strong>DIGITMATCH</strong></div><div class="detail"><label>Duration</label><strong>${esc(sig.duration||1)} tick</strong></div><div class="detail"><label>Paper stake</label><strong>${money(sig.stake)}</strong></div><div class="detail"><label>Win probability</label><strong>${pct(sig.probability)}</strong></div><div class="detail"><label>Quoted payout</label><strong>${money(sig.payout)}</strong></div><div class="detail"><label>Break-even</label><strong>${pct(sig.break_even_probability)}</strong></div><div class="detail"><label>Expected value</label><strong>${money(sig.expected_value)}</strong></div><div class="detail"><label>Signal expires</label><strong>${fmtTime(sig.expires_epoch)}</strong></div></div>`;
- $('signalFooter').innerHTML=`<span>Approved paper signal · exact forecast passed to simulator</span><code>${esc(sig.signal_id||'—')}</code>`}
-function renderStrategies(data,ready,analysis){const list=analysis?.strategies||[];if(!list.length){$('strategies').innerHTML='<div class="empty">No forecasts yet. The collector needs a full history window before strategies can be evaluated.</div>';return}$('strategies').innerHTML=`<table><thead><tr><th>Strategy</th><th>Digit</th><th>Model p</th><th>Validation n</th><th>Hit rate</th><th>Brier</th><th>Status</th></tr></thead><tbody>${list.map(x=>{const approved=x.explicitly_approved&&x.final_test_status==='evidence_of_edge';return `<tr><td class="strategy-name">${esc(x.strategy_id)}${x.selected?' · selected':''}</td><td class="num">${esc(x.predicted_digit)}</td><td class="num">${pct(x.predicted_digit_probability)}</td><td class="num">${nfmt(x.validation_sample_size)}</td><td class="num">${pct(x.validation_hit_rate)}</td><td class="num">${x.validation_brier==null?'—':Number(x.validation_brier).toFixed(4)}</td><td><span class="tag ${approved?'good':'warn'}" title="${esc(JSON.stringify(x.validation_calibration||[]))}">${approved?'APPROVED':'RESEARCH ONLY'}</span></td></tr>`}).join('')}</tbody></table><div class="panelnote" style="padding:9px 8px 0">Model probability is not a validated win rate. Calibration details are available on each status badge. Ranking alone never authorizes execution.</div>`}
-function renderActivity(trades,signals,health){const ev=[];for(const t of (trades||[]).slice(-8)){ev.push({time:t.created_utc,type:t.event_type==='PAPER_OPEN'?'Paper contract opened':'Paper contract settled',detail:`${t.symbol} · digit ${t.prediction??'—'}${t.paper_pnl!=null?' · P/L '+money(t.paper_pnl):''}`,tone:t.event_type==='PAPER_SETTLE'?'green':'amber'})}for(const e of (health?.recent_errors||[]).slice(-3)){ev.push({time:null,type:'Feed / service notice',detail:e,tone:'amber'})}ev.sort((a,b)=>new Date(b.time||0)-new Date(a.time||0));$('activity').innerHTML=ev.length?ev.slice(0,7).map(e=>`<div class="event"><time>${eventTime(e.time)}</time><i class="eventmark ${e.tone}"></i><div class="eventtext">${esc(e.type)}<small>${esc(e.detail)}</small></div></div>`).join(''):'<div class="empty">No recent events. New forecasts and paper executions will appear here.</div>'}
-function renderTrades(rows){const opens=(rows||[]).filter(x=>x.event_type==='PAPER_OPEN').slice(-8).reverse();if(!opens.length){$('trades').innerHTML='<div class="empty">No paper contracts have been opened. This is normal while strategies remain unapproved.</div>';return}$('trades').innerHTML=`<table><thead><tr><th>Time</th><th>Market</th><th>Digit</th><th>Stake</th><th>Payout</th><th>Outcome</th></tr></thead><tbody>${opens.map(x=>{const settle=(rows||[]).find(y=>y.event_type==='PAPER_SETTLE'&&y.note===String(x.seq));return `<tr><td class="num">${eventTime(x.created_utc)}</td><td>${esc(x.symbol)}</td><td class="num">${esc(x.prediction)}</td><td class="num">${money(x.stake)}</td><td class="num">${money(x.payout)}</td><td>${settle?`<span class="${Number(settle.paper_pnl)>=0?'positive':'negative'}">${Number(settle.hit)?'WIN':'LOSS'} · ${money(settle.paper_pnl)}</span>`:'<span class="muted">OPEN</span>'}</td></tr>`}).join('')}</tbody></table>`}
-function renderPayoutTiming(data){const root=$('payoutTiming');if(!data){root.innerHTML='<div class="empty">Payout test is not available.</div>';return}const best=data.best_candidate;const rows=data.strategies||[];if(!rows.length){root.innerHTML=`<div class="guard-row"><span>Quote-settled pairs</span><strong>${nfmt(data.quote_settled_pairs||0)}</strong></div><div class="empty">${esc(data.note||'Collecting live Deriv proposal quotes and waiting for each duration to settle. Historical ticks cannot recreate past payouts.')}</div>`;return}root.innerHTML=`<div class="guard-row"><span>Quote-settled contracts</span><strong>${nfmt(data.quote_settled_pairs)}</strong></div><div class="guard-row"><span>Best statistically supported duration</span><strong>${best?`${esc(best.duration_ticks)} ticks · ${esc(best.strategy_id)}`:'NONE — evidence insufficient'}</strong></div><div class="guard-row"><span>Execution authorization</span><strong>DISABLED</strong></div><div class="tablewrap"><table><thead><tr><th>Strategy</th><th>Ticks</th><th>Settled</th><th>Net P/L</th><th>Mean return</th><th>Final 95% CI</th><th>Decision</th></tr></thead><tbody>${rows.map(x=>{const f=x.final_test;return `<tr><td>${esc(x.strategy_id)}</td><td class="num">${x.duration_ticks}t</td><td class="num">${nfmt(f?.n||0)}</td><td class="num ${Number(f?.total_pnl||0)>=0?'positive':'negative'}">${money(f?.total_pnl)}</td><td class="num">${pct(f?.mean_return_on_stake)}</td><td class="num">${f?.mean_return_ci95?`${pct(f.mean_return_ci95[0])} to ${pct(f.mean_return_ci95[1])}`:'—'}</td><td><span class="tag ${x.payout_ev_status==='OUT_OF_SAMPLE_PROFIT_EVIDENCE'?'good':'warn'}">${esc(x.payout_ev_status)}</span></td></tr>`}).join('')}</tbody></table></div><p class="panelnote" style="margin-top:10px">Net P/L uses the actual quoted stake and gross payout for each settled contract. Mean return confidence intervals and Holm-adjusted significance are calculated on chronological holdouts. A positive result is evidence, not a promise.</p>`}
-function renderTiming(data){const root=$('timingResearch');const tag=$('timingTag');if(!data||!Array.isArray(data.strategies)||!data.strategies.length){tag.textContent='INSUFFICIENT DATA';root.innerHTML='<div class="empty">Not enough scored forecast history to compare digit hit rates yet.</div>';renderPayoutTiming(data?.payout_optimization);return}const best=data.best_research_candidate;tag.textContent=best?'RESEARCH LEAD · NOT APPROVED':'NO VALIDATED TIMING';root.innerHTML=`<div class="guard-row"><span>Current volatility regime</span><strong>${esc(data.current_volatility_regime||'INSUFFICIENT DATA')}</strong></div><div class="guard-row"><span>Best hit-rate research candidate</span><strong>${best?`${esc(best.duration_ticks)} ticks · ${esc(best.strategy_id)}`:'None'}</strong></div><div class="tablewrap"><table><thead><tr><th>Strategy</th><th>Duration</th><th>Samples</th><th>Hit rate</th><th>95% CI lower</th><th>Status</th></tr></thead><tbody>${data.strategies.map(x=>`<tr><td>${esc(x.strategy_id)}</td><td class="num">${esc(x.duration_ticks)}t</td><td class="num">${nfmt(x.n)}</td><td class="num">${pct(x.hit_rate)}</td><td class="num">${x.hit_rate_ci95?pct(x.hit_rate_ci95[0]):'—'}</td><td><span class="tag warn">${esc(x.timing_status)}</span></td></tr>`).join('')}</tbody></table></div><div class="guard-row"><span>Execution authorization</span><strong>DISABLED</strong></div>`;renderPayoutTiming(data.payout_optimization)}
-function renderResearch(report,symbol){const item=(report?.symbols||[]).find(x=>x.symbol===symbol);if(!item){$('research').textContent='No research report is available for this market yet.';return}const finalists=item.validation_finalists||[];$('research').innerHTML=`<div class="guard-row"><span>Research status</span><strong>${esc(item.status||'In progress')}</strong></div><div class="guard-row"><span>Ticks analyzed</span><strong>${nfmt(item.n_ticks)}</strong></div><div class="guard-row"><span>Validation finalists</span><strong>${finalists.length?nfmt(finalists.length):'None'}</strong></div><div class="guard-row"><span>Final test accessed</span><strong>${item.final_test_accessed?'Yes':'No'}</strong></div><p class="panelnote" style="margin:10px 0 0">A strategy requires frozen out-of-sample evidence and explicit approval before it can generate an execution-ready paper signal.</p>`}
-async function refreshAll(){const symbol=state.symbol;try{const [h,t,d,p,ins,sg,ready,rep,tr,timing,da]=await Promise.all([api('/health'),api(`/ticks/latest?symbol=${encodeURIComponent(symbol)}&limit=12`),api(`/digits/distribution?symbol=${encodeURIComponent(symbol)}&window=1000`),api('/paper/status'),api(`/intelligence?symbol=${encodeURIComponent(symbol)}&window=1000`),api(`/signals?symbol=${encodeURIComponent(symbol)}`),api(`/signals/ready?symbol=${encodeURIComponent(symbol)}`),api('/report'),api(`/paper/trades?symbol=${encodeURIComponent(symbol)}`),api(`/timing?symbol=${encodeURIComponent(symbol)}`),api(`/digits/analysis?symbol=${encodeURIComponent(symbol)}`)]);
- const stale=Boolean(h.stale?.[symbol]);$('connDot').className='dot '+(!stale?'ok':'warn');setText('connText',stale?'Market feed delayed':'Market feed connected');$('statusDot').className='dot '+(!stale?'ok':'warn');setText('systemStatus',stale?'Feed unavailable or stale':'Market feed operating');setText('systemMessage',stale?'No recent tick received for this symbol. New signals are suspended.':'Analysis and execution checks are running in paper mode.');setText('updatedAt',new Date().toLocaleTimeString());setText('tickCount',nfmt(h.tick_counts?.[symbol]||0));setText('marketTag',symbol);setText('tickFeedTag',t.length?'LIVE TICKS':'NO FEED');if(t.length){const x=t[0];setText('latestPrice',x.quote_text);setText('latestDigit',x.digit);setText('tickTime',fmtTime(x.epoch));$('tickTape').innerHTML=t.slice(0,12).map(x=>`<div class="tick"><b>${esc(x.digit)}</b><small>${fmtTime(x.epoch)}</small></div>`).join('')}else{$('latestPrice').textContent='—';$('latestDigit').textContent='—';$('tickTime').textContent='—';$('tickTape').innerHTML='<div class="empty">No ticks received yet.</div>'}
- renderDistribution({...d,window:1000});renderDigitAnalysis(da);renderSignal(ready,sg,symbol);renderStrategies(sg,ready,da);setText('stakeValue',money(p.stake));setText('lossLimit',money(p.daily_loss_cap));setText('tradeCount',`${nfmt(p.settled_total||0)} settled / ${nfmt(p.max_trades_per_day||0)} limit`);setText('kpiOpened',nfmt(p.opened_total||0));setText('kpiSettled',nfmt(p.settled_total||0));setText('kpiPending',`${nfmt(p.pending||0)} pending`);const settled=tr.filter(x=>x.event_type==='PAPER_SETTLE');const wins=settled.filter(x=>Number(x.hit)===1).length;setText('kpiWinRate',settled.length?pct(wins/settled.length):'—');const pnl=settled.reduce((a,x)=>a+Number(x.paper_pnl||0),0);setText('kpiPnl',settled.length?money(pnl):'—');$('kpiPnl').className=settled.length?(pnl>=0?'positive':'negative'):'';renderTrades(tr);renderActivity(tr,sg,h);renderResearch(rep,symbol);renderTiming(timing);
- }catch(e){$('connDot').className='dot warn';setText('connText','Dashboard API unavailable');setText('systemStatus','Unable to refresh');setText('systemMessage',e.message)}}
-$('symbol').addEventListener('change',e=>{state.symbol=e.target.value;refreshAll()});$('refreshBtn').addEventListener('click',refreshAll);refreshAll();setInterval(refreshAll,3000);
-</script></body></html>
-```
+```python
+from datetime import datetime, timedelta, timezone
 
----
+from bromax.agents import (
+    AgentResult,
+    ChiefIntelligenceCoordinator,
+    DataIntelligenceAgent,
+    PerformanceLearningAgent,
+    ProbabilityCalibrationAgent,
+)
+from bromax.storage import Store
 
-## `bromax/dashboard_minimal.html`
 
-```html
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BROMAX — Decision Terminal</title>
-<style>
-:root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
-</style>
-</head>
-<body>
-<header class="topbar"><div class="brand">BROMAX <small> / DECISION TERMINAL · PAPER ONLY</small></div><div class="tools"><select id="symbol" aria-label="Market symbol">__SYMBOL_OPTIONS__</select><a href="/advanced">Advanced analysis</a></div></header>
-<main class="shell">
-  <section class="section" aria-labelledby="market-heading">
-    <div class="section-title"><h2 id="market-heading">Market status</h2><span class="updated" id="updatedAt">Waiting for data</span></div>
-    <div class="market">
-      <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
-      <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
-      <div class="market-item"><span class="label">Latest tick · last digit</span><strong class="value" id="latestTick">—</strong></div>
-      <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
-    </div>
-  </section>
+def _ticks(count=3):
+    received = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    return [
+        {
+            "id": index + 1,
+            "epoch": 100 + index,
+            "quote_text": f"1.{20 + index:02d}",
+            "pip_size": 2,
+            "digit": index,
+            "received_utc": received,
+        }
+        for index in range(count)
+    ]
 
-  <section class="section signal" aria-labelledby="signal-heading">
-    <div class="section-title"><h2 id="signal-heading">Best trading signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
-    <div class="signal-grid">
-      <div class="signal-primary"><span class="label">Recommended digit</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
-      <div class="signal-item"><span class="label">Win probability</span><strong class="value" id="signalProbability">—</strong></div>
-      <div class="signal-item"><span class="label">Health</span><strong class="value" id="signalHealth">—</strong></div>
-      <div class="signal-item"><span class="label">Duration</span><strong class="value" id="signalDuration">—</strong></div>
-      <div class="signal-item"><span class="label">Quoted payout</span><strong class="value" id="signalPayout">—</strong></div>
-      <div class="signal-item"><span class="label">Expected value</span><strong class="value" id="signalEv">—</strong></div>
-    </div>
-  </section>
 
-  <section class="section" aria-labelledby="digits-heading">
-    <div class="section-title"><h2 id="digits-heading">Digit prediction · all ten digits</h2><span class="muted" id="decisionNote">Estimates are shown only when calculated.</span></div>
-    <div class="digit-wrap"><table>
-      <thead><tr><th>Digit</th><th>Win probability</th><th>Evidence health</th><th>Decision</th><th>Rejection reason</th></tr></thead>
-      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for research data.</td></tr></tbody>
-    </table></div>
-  </section>
+def test_data_agent_approves_only_fresh_contiguous_precision_checked_ticks():
+    result = DataIntelligenceAgent().run(_ticks(), False, 5)
+    assert result.status == "APPROVED"
+    assert result.metrics["quality_score"] == 100
 
-  <div class="bottom">
-    <section class="section" aria-labelledby="volatility-heading">
-      <div class="section-title"><h2 id="volatility-heading">Volatility check</h2></div>
-      <div class="summary-grid">
-        <div><span class="label">Current condition</span><strong class="value" id="volatilityCondition">—</strong></div>
-        <div><span class="label">Volatility health</span><strong class="value" id="volatilityHealth">—</strong></div>
-        <div><span class="label">Signal filter</span><strong class="value" id="volatilityApproval">—</strong></div>
-      </div>
-    </section>
-    <section class="section" aria-labelledby="paper-heading">
-      <div class="section-title"><h2 id="paper-heading">Paper trading results</h2></div>
-      <div class="summary-grid">
-        <div><span class="label">Total trades</span><strong class="value" id="tradeTotal">0</strong></div>
-        <div><span class="label">Wins</span><strong class="value" id="tradeWins">0</strong></div>
-        <div><span class="label">Losses</span><strong class="value" id="tradeLosses">0</strong></div>
-        <div><span class="label">Win rate</span><strong class="value" id="tradeWinRate">—</strong></div>
-        <div><span class="label">Net paper profit</span><strong class="value" id="tradeProfit">—</strong></div>
-      </div>
-    </section>
-  </div>
-</main>
-<script>
-'use strict';
-const $=id=>document.getElementById(id);
-const state={symbol:$('symbol').value};
-const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
-const score=value=>value==null||!Number.isFinite(Number(value))?'—':`${Number(value)}%`;
-const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(Number(value));
-const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
-function renderMarket(health,ticks,symbol){
-  $('marketSymbol').textContent=symbol;
-  const stale=Boolean(health.stale?.[symbol]);
-  const connection=$('connection');connection.className=`status ${stale?'bad':'good'}`;
-  connection.querySelector('span').textContent=stale?'DISCONNECTED / STALE':'CONNECTED';
-  if(ticks.length){
-    const tick=ticks[0],age=Math.max(0,Math.floor(Date.now()/1000-Number(tick.epoch)));
-    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
-    $('freshness').textContent=`${stale?'STALE':'FRESH'} · ${age}s`;
-    $('freshness').className=`value ${stale?'bad-text':'good-text'}`;
-  }else{
-    $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
-  }
-}
-function renderSignal(ready,analysis){
-  const signal=ready?.eligible===true?ready.signal:null;
-  const digit=signal?analysis.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit)):null;
-  const durationData=digit?.durations?.[String(signal?.duration??1)];
-  const qualified=Boolean(signal&&digit?.decision==='PAPER TRADE CANDIDATE'&&durationData?.decision==='PAPER TRADE CANDIDATE');
-  const status=$('signalStatus'),hero=$('signalDigit');
-  if(!qualified){
-    status.className='trade-pill no-trade';status.textContent='NO TRADE';
-    hero.className='signal-digit empty';hero.textContent='NO QUALIFIED SIGNAL';
-    for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
-    return null;
-  }
-  status.className='trade-pill trade';status.textContent='TRADE · PAPER ONLY';
-  hero.className='signal-digit';hero.textContent=String(signal.predicted_digit);
-  $('signalProbability').textContent=pct(signal.probability);
-  $('signalHealth').textContent=score(digit.health_percent);
-  $('signalDuration').textContent=`${signal.duration} tick${Number(signal.duration)===1?'':'s'}`;
-  $('signalPayout').textContent=money(signal.payout);
-  $('signalEv').textContent=money(signal.expected_value);
-  return Number(signal.predicted_digit);
-}
-function renderDigits(analysis,signalDigit,ready){
-  const rows=analysis?.digits||[];
-  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>{
-    const row=rows.find(item=>Number(item.digit)===digit);
-    if(!row)return `<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">Research data unavailable.</td></tr>`;
-    const approved=signalDigit===digit;
-    const duration=row.durations?.[String(ready?.signal?.duration??1)];
-    let reason='';
-    if(!approved){
-      reason=row.decision==='PAPER TRADE CANDIDATE'?(ready?.reason||'The signal failed a final readiness check.'):(row.reasons?.[0]||duration?.reasons?.[0]||'No qualifying per-digit evidence.');
-    }
-    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason)}</td></tr>`;
-  }).join('');
-}
-function renderVolatility(analysis){
-  const data=analysis?.volatility_filter||{};
-  $('volatilityCondition').textContent=data.regime||'INSUFFICIENT DATA';
-  $('volatilityHealth').textContent=score(data.health_percent);
-  const passed=data.status==='PASS';
-  const approval=$('volatilityApproval');
-  approval.textContent=data.status||'INSUFFICIENT DATA';
-  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT DATA'?'warn-text':'bad-text'}`;
-}
-function renderPaper(events){
-  const opened=(events||[]).filter(event=>event.event_type==='PAPER_OPEN').length;
-  const settled=(events||[]).filter(event=>event.event_type==='PAPER_SETTLE');
-  const wins=settled.filter(event=>Number(event.hit)===1).length;
-  const losses=settled.length-wins;
-  const profit=settled.reduce((sum,event)=>sum+Number(event.paper_pnl||0),0);
-  $('tradeTotal').textContent=Number(opened).toLocaleString('en-US');
-  $('tradeWins').textContent=String(wins);$('tradeLosses').textContent=String(losses);
-  $('tradeWinRate').textContent=settled.length?`${(wins/settled.length*100).toFixed(1)}%`:'—';
-  $('tradeProfit').textContent=settled.length?money(profit):'—';
-  $('tradeProfit').className=`value ${settled.length?(profit>=0?'good-text':'bad-text'):''}`;
-}
-function renderUnavailable(error){
-  const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
-  $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
-  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
-  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
-  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval'])$(id).textContent='—';
-  $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>`<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">API unavailable: ${safe(error.message)}</td></tr>`).join('');
-}
-async function refresh(){
-  try{
-    const symbol=state.symbol;
-    const [health,ticks,analysis,ready,events]=await Promise.all([
-      api('/health'),api(`/ticks/latest?symbol=${encodeURIComponent(symbol)}&limit=1`),
-      api(`/digits/analysis?symbol=${encodeURIComponent(symbol)}`),
-      api(`/signals/ready?symbol=${encodeURIComponent(symbol)}`),
-      api(`/paper/trades?symbol=${encodeURIComponent(symbol)}`)
-    ]);
-    renderMarket(health,ticks,symbol);
-    const selectedDigit=renderSignal(ready,analysis);
-    renderDigits(analysis,selectedDigit,ready);
-    renderVolatility(analysis);
-    renderPaper(events);
-    $('updatedAt').textContent=`Updated ${new Date().toLocaleTimeString()}`;
-  }catch(error){
-    renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
-  }
-}
-$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh()});
-refresh();setInterval(refresh,3000);
-</script>
-</body>
-</html>
+    malformed = _ticks()
+    malformed[-1]["digit"] = 9
+    result = DataIntelligenceAgent().run(malformed, False, 5)
+    assert result.status == "REJECTED"
+    assert "quote" in result.reasons[0].lower() or "missing tick" in result.reasons[0].lower()
+
+
+def test_data_agent_rejects_stale_feed_even_if_stored_ticks_look_valid():
+    result = DataIntelligenceAgent().run(_ticks(), True, 5)
+    assert result.status == "REJECTED"
+    assert result.metrics["checks"]["fresh"] is False
+
+
+def test_probability_agent_keeps_missing_estimates_missing():
+    analysis = {"digits":[
+        {"digit":digit,"estimated_win_probability":None,"health_percent":None}
+        for digit in range(10)
+    ]}
+    result = ProbabilityCalibrationAgent().run(analysis,{"signals":[]})
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.metrics["valid_digit_estimates"] == 0
+
+
+def test_performance_agent_reports_only_recorded_paper_outcomes():
+    result = PerformanceLearningAgent().run([],[],[])
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.metrics["paper_opened"] == 0
+    assert result.metrics["win_rate"] is None
+    assert result.metrics["net_paper_profit"] is None
+
+
+def test_agent_run_persistence_is_immutable_and_throttled_by_decision(tmp_path):
+    store = Store(str(tmp_path / "agent-runs.sqlite3"))
+    agents = [{"agent_id": "chief_intelligence_coordinator", "status": "INSUFFICIENT_EVIDENCE"}]
+    assert store.record_agent_run("snapshot-1", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
+    assert not store.record_agent_run("snapshot-2", "1HZ100V", 7, "NO TRADE", "NO TRADE", agents)
+    assert store.record_agent_run("snapshot-3", "1HZ100V", 7, "NO TRADE", "NO TRADE|digit=4", agents)
+    runs = store.agent_runs("1HZ100V")
+    assert [run["snapshot_id"] for run in runs] == ["snapshot-3", "snapshot-1"]
+    assert runs[0]["agent_results"] == agents
+    with store.connect() as connection:
+        try:
+            connection.execute("UPDATE agent_runs SET final_status='TRADE'")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("agent run records must be immutable")
+
+
+def test_coordinator_vetoes_even_an_approved_specialist_result_on_mixed_snapshot():
+    risk = AgentResult(
+        agent_id="risk_signal_approval",
+        status="APPROVED",
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+        duration_ms=1,
+        summary="approved",
+        reasons=(),
+        metrics={},
+        output={"trade_authorized": True, "signal": {"predicted_digit": 2}},
+    )
+    result = ChiefIntelligenceCoordinator().coordinate([], risk, consistent=False)
+    assert result.status == "INSUFFICIENT_EVIDENCE"
+    assert result.output["trade_authorized"] is False
+    assert result.output["final_status"] == "NO TRADE — INSUFFICIENT EVIDENCE"
 ```
 
 ---
@@ -2725,6 +3558,7 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert "/intelligence" in paths
     assert "/signals" in paths
     assert "/signals/ready" in paths
+    assert "/decision" in paths
     assert "/timing" in paths
     assert "/bridge/status" in paths
     assert "/dashboard" in paths
@@ -2741,6 +3575,8 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert "NO QUALIFIED SIGNAL" in page
     assert "Digit prediction" in page
     assert page.count("<section ")==5
+    assert "/decision?symbol=" in page
+    assert "/digits/analysis?symbol=" not in page
     assert "Timing & volatility research" not in page
     advanced=api_module.advanced_dashboard()
     assert "Ready to trade" in advanced
@@ -2755,6 +3591,38 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert timing["durations_tested_ticks"] == [1, 2, 3, 4, 5]
     assert "payout_optimization" in timing
     assert timing["payout_optimization"]["execution_authorized"] is False
+
+
+def test_unified_decision_returns_one_persisted_no_trade_snapshot(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"decision.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{}}]})
+    monkeypatch.setattr(api_module,"digit_analysis",lambda symbol:{
+        "latest_tick":None,"volatility_filter":{"status":"INSUFFICIENT DATA"},
+        "digits":[{"digit":digit,"estimated_win_probability":None,"health_percent":None,
+                   "decision":"DO NOT TRADE","reasons":["Insufficient validated evidence."]}
+                  for digit in range(10)],
+    })
+    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[],"trade_authorized":False})
+    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[]})
+    monkeypatch.setattr(api_module,"ready_signal",lambda symbol:{
+        "symbol":symbol,"status":"WAITING","eligible":False,"signal":None,
+        "reason":"No statistically approved quote-backed signal.",
+    })
+
+    first=api_module.unified_decision("1HZ100V")
+    second=api_module.unified_decision("1HZ100V")
+    assert first["trade_authorized"] is False
+    assert first["final_status"]=="NO TRADE — INSUFFICIENT EVIDENCE"
+    assert len(first["digits"])==10
+    assert len(first["agents"])==8
+    assert first["agent_run_persisted"] is True
+    assert second["agent_run_persisted"] is False
+    assert len(api_module.store.agent_runs("1HZ100V"))==1
+    assert {agent["evaluated_at"] for agent in first["agents"]}=={first["created_at"]}
 
 def test_digit_analysis_returns_all_digits_without_inventing_estimates(monkeypatch, tmp_path):
     import importlib
@@ -3469,9 +4337,17 @@ On Windows, `python -m bromax.desktop` opens the synchronized Tkinter panel for 
 
 ## Minimal decision terminal
 
-`GET /dashboard` is the primary compact screen: market freshness, all ten digit estimates and evidence scores with rejection reasons, one signal that must pass both `/signals/ready` and per-digit qualification, the current volatility filter, and recorded paper results. Probabilities and health remain blank when the API has no corresponding calculated result. The volatility health percentage is the fraction of six observed current-regime holdout checks passed (validation and final-test sample minimum, hit-rate lower bound, and Holm-adjusted significance); it is an evidence score, not a probability.
+`GET /dashboard` is the primary compact screen. The dashboard and Windows floating panel both consume `GET /decision?symbol=...`; they do not independently combine `/digits/analysis` and `/signals/ready` responses. Each response has a snapshot ID and timestamp, is tied to one latest tick ID, and is vetoed if the latest tick changes while the inputs are assembled. The response includes the ten calculated digit probabilities and evidence-health scores, rejection reasons, the coordinator's signal, current market and volatility status, actual paper-ledger outcomes, and all eight agent summaries. Missing estimates remain `null`; no percentages are substituted.
 
 The previous detailed dashboard is preserved at `GET /advanced`. The floating Windows panel shows only the same recommended digit, probability, health, duration, volatility approval, and paper-only trade status.
+
+### Deterministic specialist coordination
+
+`bromax/agents.py` defines typed, deterministic specialists for data quality, statistical strategy research, probability/calibration integrity, market regime, quote-backed contract economics, independent risk approval, and performance monitoring, plus the chief coordinator. These are ordinary Python functions over existing report, quote, tick, and paper-ledger facts—not LLM-generated forecasts. Optional LLM research is disabled and cannot authorize a trade.
+
+The risk specialist requires the unchanged existing statistical-finalist and untouched-test checks, a complete ten-digit probability vector, fresh contiguous precision-verified ticks, a passing strategy-specific volatility filter, an unexpired matching proposal, positive recomputed EV, explicit strategy approval, paper-only mode, and per-digit qualification. The chief coordinator also vetoes an inconsistent snapshot. Missing evidence returns `NO TRADE — INSUFFICIENT EVIDENCE`; failed validation returns `REJECTED — FAILED VALIDATION`.
+
+Agent outputs are persisted to the append-only SQLite `agent_runs` ledger. Identical final status and signal snapshots are throttled to one record per symbol per minute; a changed signal identity is recorded immediately. The ledger has update/delete guards. The dashboard and panel render the same endpoint shape; their polling intervals may differ, but each individual display is internally consistent to one snapshot. This endpoint remains paper-only and does not add order execution.
 ````
 
 ---
@@ -3562,6 +4438,8 @@ BROMAX is one connected application, not two independent predictors. The Deriv c
 
 **No live trading:** this build intentionally contains no API token login, no account authorization, and no `buy`/`sell` request. It is fully runnable in live-feed + read-only-quote + paper-execution mode. Because no strategy has been validated and explicitly approved by default, a fresh installation starts in observation/research mode and does not fabricate trades.
 
+The minimal dashboard and Windows floating panel both consume `GET /decision?symbol=...`. This single deterministic snapshot runs eight specialist roles (including the coordinator), checks that the market tick did not change during evaluation, and exposes a paper signal only when the existing research, probability, quote, volatility, approval, and risk gates all pass. Agent summaries are stored append-only and repeated identical decisions are throttled; an LLM is not needed to calculate probabilities or authorize trades.
+
 ## 2. What was inspected and changed
 
 The available earlier project was `deriv_matches_starter.zip`, containing `app/main.py`, `README.md`, `requirements.txt`, and `.env.example`. A separate `app.py` and the `quant-system-prod` repository itself were not present in the available uploads or Library search results; only a directory listing mentioning that ZIP was available. I therefore inspected and extended the available `app/main.py` starter. The specific `int(round(value)) % 10` expression you mentioned was not present in that inspected file, so I do not attribute it to that source.
@@ -3594,6 +4472,7 @@ BROMAX/
 ├── bromax/
 │   ├── __init__.py
 │   ├── api.py
+│   ├── agents.py                 # typed deterministic specialists and decision coordinator
 │   ├── cli.py
 │   ├── collector.py
 │   ├── config.py
@@ -3613,6 +4492,7 @@ BROMAX/
 └── tests/
     ├── test_digits.py
     ├── test_leakage.py
+    ├── test_agents.py
     ├── test_research.py
     ├── test_storage.py
     └── test_api.py
@@ -3680,6 +4560,7 @@ The dashboard opens at `http://127.0.0.1:8765/dashboard`; the API docs are at `h
 
 - `GET /dashboard` — minimal five-section trading decision terminal.
 - `GET /advanced` — detailed research, strategy, timing, and historical dashboard.
+- `GET /decision?symbol=1HZ100V` — one timestamped response for the dashboard and floating panel, including all ten digit decisions, market freshness, volatility, recorded paper results, and the eight deterministic agent results. It fails closed if the latest tick changes during evaluation.
 - `GET /health` — collector state, per-symbol tick count, last quote, stale-data status and recent errors.
 - `GET /ticks/latest?symbol=1HZ100V` — latest raw/displayed quotes and digits.
 - `GET /digits/distribution?symbol=1HZ100V&window=1000` — rolling empirical digit frequencies.
@@ -3860,6 +4741,11 @@ All dashboard and API endpoints, including API documentation, require those cred
 ## `CHANGELOG.md`
 
 ````markdown
+## Deterministic multi-agent decision snapshot
+- Added eight typed specialist/coordinator roles that reuse existing research, calibration, volatility, quote, risk, and paper-ledger calculations; no LLM output can generate probabilities or authorize trades.
+- Added `GET /decision` as the synchronized source for the minimal dashboard and Windows floating panel, including same-tick consistency checks and fail-closed signal approval.
+- Added immutable, throttled agent-run persistence and focused tests for data quality, no-trade vetoes, persistence, and snapshot synchronization.
+
 ## 2.2.1
 - Changed the local BROMAX web/API listening port from 8000 to 8765 to avoid the previously occupied port. Updated launch command and dashboard URL.
 - Replaced the primary dashboard with a compact five-section decision terminal; retained the detailed dashboard at `/advanced`.
@@ -3987,6 +4873,10 @@ data/*.sqlite3-wal
 reports/*.json
 approved_strategies.json
 *.egg-info/
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
 ```
 
 ---
@@ -4030,3 +4920,4 @@ EXPOSE 8765
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8765}"]
 ```
 
+---

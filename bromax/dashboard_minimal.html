@@ -66,105 +66,92 @@
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
-const state={symbol:$('symbol').value};
+const state={symbol:$('symbol').value,currency:'USD'};
 const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
 const score=value=>value==null||!Number.isFinite(Number(value))?'—':`${Number(value)}%`;
-const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(Number(value));
+const money=value=>value==null||!Number.isFinite(Number(value))?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:state.currency,maximumFractionDigits:2}).format(Number(value));
 const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
-function renderMarket(health,ticks,symbol){
+function renderMarket(decision){
+  const symbol=decision.symbol,market=decision.market_status||{},tick=market.latest_tick;
+  state.currency=decision.currency||'USD';
   $('marketSymbol').textContent=symbol;
-  const stale=Boolean(health.stale?.[symbol]);
-  const connection=$('connection');connection.className=`status ${stale?'bad':'good'}`;
-  connection.querySelector('span').textContent=stale?'DISCONNECTED / STALE':'CONNECTED';
-  if(ticks.length){
-    const tick=ticks[0],age=Math.max(0,Math.floor(Date.now()/1000-Number(tick.epoch)));
+  const connected=Boolean(market.connected);
+  const connection=$('connection');connection.className=`status ${connected?'good':'bad'}`;
+  connection.querySelector('span').textContent=connected?'CONNECTED':'STALE / NOT APPROVED';
+  if(tick){
+    const age=market.freshness_seconds;
     $('latestTick').textContent=`${tick.quote_text} · ${tick.digit}`;
-    $('freshness').textContent=`${stale?'STALE':'FRESH'} · ${age}s`;
-    $('freshness').className=`value ${stale?'bad-text':'good-text'}`;
+    $('freshness').textContent=`${connected?'FRESH':'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
+    $('freshness').className=`value ${connected?'good-text':'bad-text'}`;
   }else{
     $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
   }
 }
-function renderSignal(ready,analysis){
-  const signal=ready?.eligible===true?ready.signal:null;
-  const digit=signal?analysis.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit)):null;
-  const durationData=digit?.durations?.[String(signal?.duration??1)];
-  const qualified=Boolean(signal&&digit?.decision==='PAPER TRADE CANDIDATE'&&durationData?.decision==='PAPER TRADE CANDIDATE');
+function renderSignal(decision){
+  const signal=decision?.trade_authorized===true?decision.signal:null;
   const status=$('signalStatus'),hero=$('signalDigit');
-  if(!qualified){
+  if(!signal){
     status.className='trade-pill no-trade';status.textContent='NO TRADE';
     hero.className='signal-digit empty';hero.textContent='NO QUALIFIED SIGNAL';
     for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
-    return null;
+    return;
   }
   status.className='trade-pill trade';status.textContent='TRADE · PAPER ONLY';
   hero.className='signal-digit';hero.textContent=String(signal.predicted_digit);
   $('signalProbability').textContent=pct(signal.probability);
-  $('signalHealth').textContent=score(digit.health_percent);
+  const digit=decision.digits.find(row=>Number(row.digit)===Number(signal.predicted_digit));
+  $('signalHealth').textContent=score(digit?.health_percent);
   $('signalDuration').textContent=`${signal.duration} tick${Number(signal.duration)===1?'':'s'}`;
   $('signalPayout').textContent=money(signal.payout);
   $('signalEv').textContent=money(signal.expected_value);
-  return Number(signal.predicted_digit);
 }
-function renderDigits(analysis,signalDigit,ready){
-  const rows=analysis?.digits||[];
+function renderDigits(decision){
+  const rows=decision?.digits||[];
   $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>{
     const row=rows.find(item=>Number(item.digit)===digit);
     if(!row)return `<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">Research data unavailable.</td></tr>`;
-    const approved=signalDigit===digit;
-    const duration=row.durations?.[String(ready?.signal?.duration??1)];
-    let reason='';
-    if(!approved){
-      reason=row.decision==='PAPER TRADE CANDIDATE'?(ready?.reason||'The signal failed a final readiness check.'):(row.reasons?.[0]||duration?.reasons?.[0]||'No qualifying per-digit evidence.');
-    }
-    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason)}</td></tr>`;
+    const approved=row.decision==='TRADE';
+    const reason=(row.reasons||[]).join(' ');
+    return `<tr class="${approved?'row-trade':''}"><td class="digit-cell">${digit}</td><td class="num">${pct(row.estimated_win_probability)}</td><td class="num">${score(row.health_percent)}</td><td class="${approved?'decision-trade':'decision-no'}">${approved?'TRADE · PAPER':'NO TRADE'}</td><td class="reason">${safe(approved?'All required evidence and signal gates passed.':reason||'No qualifying per-digit evidence.')}</td></tr>`;
   }).join('');
 }
-function renderVolatility(analysis){
-  const data=analysis?.volatility_filter||{};
-  $('volatilityCondition').textContent=data.regime||'INSUFFICIENT DATA';
+function renderVolatility(decision){
+  const data=decision?.volatility||{};
+  $('volatilityCondition').textContent=data.condition||'INSUFFICIENT DATA';
   $('volatilityHealth').textContent=score(data.health_percent);
-  const passed=data.status==='PASS';
+  const passed=data.status==='APPROVED';
   const approval=$('volatilityApproval');
-  approval.textContent=data.status||'INSUFFICIENT DATA';
-  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT DATA'?'warn-text':'bad-text'}`;
+  approval.textContent=passed?'PASS':data.status==='INSUFFICIENT_EVIDENCE'?'INSUFFICIENT DATA':'FAIL';
+  approval.className=`value ${passed?'good-text':data.status==='INSUFFICIENT_EVIDENCE'?'warn-text':'bad-text'}`;
 }
-function renderPaper(events){
-  const opened=(events||[]).filter(event=>event.event_type==='PAPER_OPEN').length;
-  const settled=(events||[]).filter(event=>event.event_type==='PAPER_SETTLE');
-  const wins=settled.filter(event=>Number(event.hit)===1).length;
-  const losses=settled.length-wins;
-  const profit=settled.reduce((sum,event)=>sum+Number(event.paper_pnl||0),0);
-  $('tradeTotal').textContent=Number(opened).toLocaleString('en-US');
+function renderPaper(performance){
+  const total=Number(performance?.paper_opened||0);
+  const wins=Number(performance?.wins||0),losses=Number(performance?.losses||0);
+  const settled=Number(performance?.paper_settled||0),profit=performance?.net_paper_profit;
+  $('tradeTotal').textContent=total.toLocaleString('en-US');
   $('tradeWins').textContent=String(wins);$('tradeLosses').textContent=String(losses);
-  $('tradeWinRate').textContent=settled.length?`${(wins/settled.length*100).toFixed(1)}%`:'—';
-  $('tradeProfit').textContent=settled.length?money(profit):'—';
-  $('tradeProfit').className=`value ${settled.length?(profit>=0?'good-text':'bad-text'):''}`;
+  $('tradeWinRate').textContent=settled?`${(Number(performance.win_rate)*100).toFixed(1)}%`:'—';
+  $('tradeProfit').textContent=profit==null?'—':money(profit);
+  $('tradeProfit').className=`value ${profit==null?'':Number(profit)>=0?'good-text':'bad-text'}`;
 }
 function renderUnavailable(error){
   const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
   $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
   $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='NO TRADE';
   $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO QUALIFIED SIGNAL';
-  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval'])$(id).textContent='—';
+  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv','volatilityCondition','volatilityHealth','volatilityApproval','tradeTotal','tradeWins','tradeLosses','tradeWinRate','tradeProfit'])$(id).textContent='—';
   $('digitRows').innerHTML=Array.from({length:10},(_,digit)=>`<tr><td class="digit-cell">${digit}</td><td class="num">—</td><td class="num">—</td><td class="decision-no">NO TRADE</td><td class="reason">API unavailable: ${safe(error.message)}</td></tr>`).join('');
 }
 async function refresh(){
   try{
-    const symbol=state.symbol;
-    const [health,ticks,analysis,ready,events]=await Promise.all([
-      api('/health'),api(`/ticks/latest?symbol=${encodeURIComponent(symbol)}&limit=1`),
-      api(`/digits/analysis?symbol=${encodeURIComponent(symbol)}`),
-      api(`/signals/ready?symbol=${encodeURIComponent(symbol)}`),
-      api(`/paper/trades?symbol=${encodeURIComponent(symbol)}`)
-    ]);
-    renderMarket(health,ticks,symbol);
-    const selectedDigit=renderSignal(ready,analysis);
-    renderDigits(analysis,selectedDigit,ready);
-    renderVolatility(analysis);
-    renderPaper(events);
-    $('updatedAt').textContent=`Updated ${new Date().toLocaleTimeString()}`;
+    const decision=await api(`/decision?symbol=${encodeURIComponent(state.symbol)}`);
+    renderMarket(decision);
+    renderSignal(decision);
+    renderDigits(decision);
+    renderVolatility(decision);
+    renderPaper(decision.performance);
+    $('updatedAt').textContent=`Updated ${new Date(decision.created_at).toLocaleTimeString()}`;
   }catch(error){
     renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
   }

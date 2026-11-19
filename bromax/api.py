@@ -9,10 +9,12 @@ from .config import Settings
 from .storage import Store
 from .collector import MarketCollector
 from .paperbot import PaperBot
+from .agents import coordinate_snapshot
 from .reporting import write_report
 from .intelligence import analyze_ticks
 from .timing import evaluate_timing, evaluate_payout_timing
 from .strategies import candidate_strategies, ForecastContext
+from uuid import uuid4
 
 logging.basicConfig(level=logging.INFO)
 settings=Settings.from_env(); store=Store(settings.database_path)
@@ -507,6 +509,124 @@ def digit_analysis(symbol: str):
                              "by_strategy":performance_groups("strategy_id"),
                              "settled_contracts":len(settled)},
         "note":"A digit's health is a research evidence score, not a win probability. Every displayed estimate comes from the current model or recorded outcomes. TRADE status is paper-only and requires all evidence, quote, timing, approval and risk gates.",
+    }
+
+@app.get("/decision")
+def unified_decision(symbol: str):
+    """Return one timestamped, internally checked paper-only decision snapshot."""
+    from datetime import datetime, timezone
+    if symbol not in settings.symbols:
+        raise HTTPException(404,"Symbol not configured")
+    snapshot_id=str(uuid4())
+    snapshot_timestamp=datetime.now(timezone.utc).isoformat()
+    initial_ticks=store.quality_history(symbol,1)
+    initial_tick_id=initial_ticks[-1]["id"] if initial_ticks else None
+    report_data=report()
+    report_item=next((item for item in report_data.get("symbols",[]) if item.get("symbol")==symbol),{})
+    digit_data=digit_analysis(symbol)
+    signal_data=signals(symbol)
+    timing_data=timing_research(symbol)
+    ready=ready_signal(symbol)
+    quality_ticks=store.quality_history(symbol,21)
+    paper_events=store.paper_events(symbol)
+    forecast_rows=store.forecasts(symbol,limit=5000)
+    prior_runs=store.agent_runs(symbol,limit=20)
+    final_tick=store.quality_history(symbol,1)
+    final_tick_id=final_tick[-1]["id"] if final_tick else None
+    current_signal_tick_id=signal_data.get("observed_tick_id")
+    digit_tick=(digit_data.get("latest_tick") or {}).get("id")
+    consistent=bool(
+        initial_tick_id is not None
+        and initial_tick_id==final_tick_id
+        and current_signal_tick_id==initial_tick_id
+        and digit_tick==initial_tick_id
+    )
+    feed_stale=(
+        collector.last_received.get(symbol) is None
+        or time.time()-collector.last_received[symbol]>settings.max_data_age_seconds
+    )
+    coordinated=coordinate_snapshot(
+        report_item=report_item,
+        digit_analysis=digit_data,
+        signal_data=signal_data,
+        timing=timing_data,
+        ready=ready,
+        quality_ticks=quality_ticks,
+        feed_stale=feed_stale,
+        max_data_age_seconds=settings.max_data_age_seconds,
+        collector_errors=collector.errors,
+        paper_events=paper_events,
+        forecasts=forecast_rows,
+        prior_runs=prior_runs,
+        consistent=consistent,
+        snapshot_timestamp=snapshot_timestamp,
+    )
+    decision_data=coordinated["decision"]
+    risk_result=next(item for item in coordinated["agents"] if item["agent_id"]=="risk_signal_approval")
+    approved_signal=decision_data.get("signal") if decision_data.get("trade_authorized") else None
+    decision_key="|".join(str(value) for value in (
+        decision_data.get("final_status"),
+        (approved_signal or {}).get("signal_id"),
+        (approved_signal or {}).get("predicted_digit"),
+        (approved_signal or {}).get("duration"),
+        (approved_signal or {}).get("probability"),
+    ))
+    persisted=store.record_agent_run(
+        snapshot_id=snapshot_id,
+        symbol=symbol,
+        snapshot_tick_id=final_tick_id,
+        final_status=decision_data.get("final_status","NO TRADE — INSUFFICIENT EVIDENCE"),
+        decision_key=decision_key,
+        agent_results=coordinated["agents"],
+    )
+    signal_digit=int(approved_signal["predicted_digit"]) if approved_signal else None
+    digit_predictions=[]
+    for row in digit_data.get("digits",[]):
+        is_approved=bool(
+            approved_signal
+            and int(row["digit"])==signal_digit
+            and row.get("decision")=="PAPER TRADE CANDIDATE"
+        )
+        rejection_reasons=list(row.get("reasons") or [])
+        if not is_approved and row.get("decision")=="PAPER TRADE CANDIDATE":
+            rejection_reasons.extend(risk_result["reasons"])
+        digit_predictions.append({
+            "digit":int(row["digit"]),
+            "estimated_win_probability":row.get("estimated_win_probability"),
+            "health_percent":row.get("health_percent"),
+            "decision":"TRADE" if is_approved else "NO TRADE",
+            "reasons":[] if is_approved else list(dict.fromkeys(rejection_reasons or ["No fully qualified paper signal for this digit."])),
+        })
+    data_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="data_intelligence")
+    regime_agent=next(item for item in coordinated["agents"] if item["agent_id"]=="market_regime")
+    return {
+        "snapshot_id":snapshot_id,
+        "created_at":snapshot_timestamp,
+        "symbol":symbol,
+        "currency":settings.currency,
+        "mode":"PAPER_ONLY",
+        "snapshot_consistent":consistent,
+        "snapshot_tick_id":final_tick_id,
+        "latest_tick":final_tick[-1] if final_tick else None,
+        "final_status":decision_data.get("final_status"),
+        "trade_authorized":bool(decision_data.get("trade_authorized")),
+        "signal":approved_signal,
+        "reasons":risk_result["reasons"],
+        "market_status":{
+            "connected":not feed_stale,
+            "data_quality_status":data_agent["status"],
+            "freshness_seconds":data_agent["metrics"].get("latest_tick_age_seconds"),
+            "latest_tick":final_tick[-1] if final_tick else None,
+        },
+        "digits":digit_predictions,
+        "volatility":{
+            "condition":regime_agent["metrics"].get("current_regime"),
+            "health_percent":regime_agent["metrics"].get("volatility_health_percent"),
+            "status":regime_agent["status"],
+        },
+        "agents":coordinated["agents"],
+        "performance":coordinated["performance"],
+        "agent_run_persisted":persisted,
     }
 
 @app.get("/signals")

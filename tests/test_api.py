@@ -13,6 +13,7 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert "/intelligence" in paths
     assert "/signals" in paths
     assert "/signals/ready" in paths
+    assert "/decision" in paths
     assert "/timing" in paths
     assert "/bridge/status" in paths
     assert "/dashboard" in paths
@@ -29,6 +30,8 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert "NO QUALIFIED SIGNAL" in page
     assert "Digit prediction" in page
     assert page.count("<section ")==5
+    assert "/decision?symbol=" in page
+    assert "/digits/analysis?symbol=" not in page
     assert "Timing & volatility research" not in page
     advanced=api_module.advanced_dashboard()
     assert "Ready to trade" in advanced
@@ -43,6 +46,38 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert timing["durations_tested_ticks"] == [1, 2, 3, 4, 5]
     assert "payout_optimization" in timing
     assert timing["payout_optimization"]["execution_authorized"] is False
+
+
+def test_unified_decision_returns_one_persisted_no_trade_snapshot(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("DATABASE_PATH",str(tmp_path/"decision.sqlite3"))
+    monkeypatch.setenv("DERIV_SYMBOLS","1HZ100V")
+    import bromax.api as api_module
+    api_module=importlib.reload(api_module)
+    monkeypatch.setattr(api_module,"report",lambda:{"symbols":[{"symbol":"1HZ100V","digit_evidence":{}}]})
+    monkeypatch.setattr(api_module,"digit_analysis",lambda symbol:{
+        "latest_tick":None,"volatility_filter":{"status":"INSUFFICIENT DATA"},
+        "digits":[{"digit":digit,"estimated_win_probability":None,"health_percent":None,
+                   "decision":"DO NOT TRADE","reasons":["Insufficient validated evidence."]}
+                  for digit in range(10)],
+    })
+    monkeypatch.setattr(api_module,"signals",lambda symbol:{"signals":[],"trade_authorized":False})
+    monkeypatch.setattr(api_module,"timing_research",lambda symbol:{"strategies":[]})
+    monkeypatch.setattr(api_module,"ready_signal",lambda symbol:{
+        "symbol":symbol,"status":"WAITING","eligible":False,"signal":None,
+        "reason":"No statistically approved quote-backed signal.",
+    })
+
+    first=api_module.unified_decision("1HZ100V")
+    second=api_module.unified_decision("1HZ100V")
+    assert first["trade_authorized"] is False
+    assert first["final_status"]=="NO TRADE — INSUFFICIENT EVIDENCE"
+    assert len(first["digits"])==10
+    assert len(first["agents"])==8
+    assert first["agent_run_persisted"] is True
+    assert second["agent_run_persisted"] is False
+    assert len(api_module.store.agent_runs("1HZ100V"))==1
+    assert {agent["evaluated_at"] for agent in first["agents"]}=={first["created_at"]}
 
 def test_digit_analysis_returns_all_digits_without_inventing_estimates(monkeypatch, tmp_path):
     import importlib

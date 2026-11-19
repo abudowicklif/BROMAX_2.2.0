@@ -10,6 +10,8 @@ BROMAX is one connected application, not two independent predictors. The Deriv c
 
 **No live trading:** this build intentionally contains no API token login, no account authorization, and no `buy`/`sell` request. It is fully runnable in live-feed + read-only-quote + paper-execution mode. Because no strategy has been validated and explicitly approved by default, a fresh installation starts in observation/research mode and does not fabricate trades.
 
+The minimal dashboard and Windows floating panel both consume `GET /decision?symbol=...`. This single deterministic snapshot runs eight specialist roles (including the coordinator), checks that the market tick did not change during evaluation, and exposes a paper signal only when the existing research, probability, quote, volatility, approval, and risk gates all pass. Agent summaries are stored append-only and repeated identical decisions are throttled; an LLM is not needed to calculate probabilities or authorize trades.
+
 ## 2. What was inspected and changed
 
 The available earlier project was `deriv_matches_starter.zip`, containing `app/main.py`, `README.md`, `requirements.txt`, and `.env.example`. A separate `app.py` and the `quant-system-prod` repository itself were not present in the available uploads or Library search results; only a directory listing mentioning that ZIP was available. I therefore inspected and extended the available `app/main.py` starter. The specific `int(round(value)) % 10` expression you mentioned was not present in that inspected file, so I do not attribute it to that source.
@@ -42,6 +44,7 @@ BROMAX/
 ├── bromax/
 │   ├── __init__.py
 │   ├── api.py
+│   ├── agents.py                 # typed deterministic specialists and decision coordinator
 │   ├── cli.py
 │   ├── collector.py
 │   ├── config.py
@@ -61,6 +64,7 @@ BROMAX/
 └── tests/
     ├── test_digits.py
     ├── test_leakage.py
+    ├── test_agents.py
     ├── test_research.py
     ├── test_storage.py
     └── test_api.py
@@ -128,6 +132,7 @@ The dashboard opens at `http://127.0.0.1:8765/dashboard`; the API docs are at `h
 
 - `GET /dashboard` — minimal five-section trading decision terminal.
 - `GET /advanced` — detailed research, strategy, timing, and historical dashboard.
+- `GET /decision?symbol=1HZ100V` — one timestamped response for the dashboard and floating panel, including all ten digit decisions, market freshness, volatility, recorded paper results, and the eight deterministic agent results. It fails closed if the latest tick changes during evaluation.
 - `GET /health` — collector state, per-symbol tick count, last quote, stale-data status and recent errors.
 - `GET /ticks/latest?symbol=1HZ100V` — latest raw/displayed quotes and digits.
 - `GET /digits/distribution?symbol=1HZ100V&window=1000` — rolling empirical digit frequencies.

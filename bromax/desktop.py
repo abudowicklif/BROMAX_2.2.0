@@ -78,13 +78,9 @@ class AnalysisPanel:
             token=base64.b64encode(f"{self.username}:{self.password}".encode("utf-8")).decode("ascii")
             headers["Authorization"]=f"Basic {token}"
         symbol=urllib.parse.quote(self.symbol)
-        data={}
-        for key,path in (("analysis",f"/digits/analysis?symbol={symbol}"),
-                         ("ready",f"/signals/ready?symbol={symbol}")):
-            request=urllib.request.Request(f"{self.base_url}{path}",headers=headers)
-            with urllib.request.urlopen(request,timeout=5) as response:
-                data[key]=json.loads(response.read().decode("utf-8"))
-        return data
+        request=urllib.request.Request(f"{self.base_url}/decision?symbol={symbol}",headers=headers)
+        with urllib.request.urlopen(request,timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def refresh(self):
         if self.request_in_progress:
@@ -133,29 +129,24 @@ class AnalysisPanel:
             self.root.after(50,self.refresh)
 
     def _render(self,data):
-        analysis=data["analysis"]
-        ready=data["ready"]
-        signal=ready.get("signal") if ready.get("eligible") is True else None
-        digit_row=next((row for row in analysis.get("digits",[])
+        signal=data.get("signal") if data.get("trade_authorized") is True else None
+        digit_row=next((row for row in data.get("digits",[])
                         if signal and int(row.get("digit",-1))==int(signal.get("predicted_digit",-2))),None)
-        duration_row=(digit_row or {}).get("durations",{}).get(str(signal.get("duration",1))) if signal else None
-        qualified=bool(signal and digit_row and digit_row.get("decision")=="PAPER TRADE CANDIDATE"
-                       and duration_row and duration_row.get("decision")=="PAPER TRADE CANDIDATE")
+        qualified=bool(signal and digit_row and digit_row.get("decision")=="TRADE")
+        volatility=data.get("volatility") or {}
         if not qualified:
-            volatility=analysis.get("volatility_filter") or {}
             for key in ("probability","health","duration"):
                 self.fields[key].configure(text="—")
             self.fields["digit"].configure(text="NO QUALIFIED SIGNAL")
-            self.fields["volatility"].configure(text=volatility.get("status","INSUFFICIENT DATA"))
+            self.fields["volatility"].configure(text=volatility.get("status","INSUFFICIENT_EVIDENCE"))
             self.fields["status"].configure(text="NO TRADE",foreground="#d78e88")
             return
-        volatility=analysis.get("volatility_filter") or {}
         self.fields["digit"].configure(text=str(signal["predicted_digit"]))
         self.fields["probability"].configure(text=f"{float(signal['probability'])*100:.1f}%")
         health=digit_row.get("health_percent")
         self.fields["health"].configure(text=f"{health}%" if health is not None else "—")
         self.fields["duration"].configure(text=f"{signal['duration']} tick(s)")
-        self.fields["volatility"].configure(text="PASS" if volatility.get("status")=="PASS" else "FAIL")
+        self.fields["volatility"].configure(text="PASS" if volatility.get("status")=="APPROVED" else "FAIL")
         self.fields["status"].configure(text="TRADE · PAPER ONLY",foreground="#85d2a3")
 
     def _render_unavailable(self,status):

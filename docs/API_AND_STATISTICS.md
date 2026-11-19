@@ -68,6 +68,14 @@ On Windows, `python -m bromax.desktop` opens the synchronized Tkinter panel for 
 
 ## Minimal decision terminal
 
-`GET /dashboard` is the primary compact screen: market freshness, all ten digit estimates and evidence scores with rejection reasons, one signal that must pass both `/signals/ready` and per-digit qualification, the current volatility filter, and recorded paper results. Probabilities and health remain blank when the API has no corresponding calculated result. The volatility health percentage is the fraction of six observed current-regime holdout checks passed (validation and final-test sample minimum, hit-rate lower bound, and Holm-adjusted significance); it is an evidence score, not a probability.
+`GET /dashboard` is the primary compact screen. The dashboard and Windows floating panel both consume `GET /decision?symbol=...`; they do not independently combine `/digits/analysis` and `/signals/ready` responses. Each response has a snapshot ID and timestamp, is tied to one latest tick ID, and is vetoed if the latest tick changes while the inputs are assembled. The response includes the ten calculated digit probabilities and evidence-health scores, rejection reasons, the coordinator's signal, current market and volatility status, actual paper-ledger outcomes, and all eight agent summaries. Missing estimates remain `null`; no percentages are substituted.
 
 The previous detailed dashboard is preserved at `GET /advanced`. The floating Windows panel shows only the same recommended digit, probability, health, duration, volatility approval, and paper-only trade status.
+
+### Deterministic specialist coordination
+
+`bromax/agents.py` defines typed, deterministic specialists for data quality, statistical strategy research, probability/calibration integrity, market regime, quote-backed contract economics, independent risk approval, and performance monitoring, plus the chief coordinator. These are ordinary Python functions over existing report, quote, tick, and paper-ledger facts—not LLM-generated forecasts. Optional LLM research is disabled and cannot authorize a trade.
+
+The risk specialist requires the unchanged existing statistical-finalist and untouched-test checks, a complete ten-digit probability vector, fresh contiguous precision-verified ticks, a passing strategy-specific volatility filter, an unexpired matching proposal, positive recomputed EV, explicit strategy approval, paper-only mode, and per-digit qualification. The chief coordinator also vetoes an inconsistent snapshot. Missing evidence returns `NO TRADE — INSUFFICIENT EVIDENCE`; failed validation returns `REJECTED — FAILED VALIDATION`.
+
+Agent outputs are persisted to the append-only SQLite `agent_runs` ledger. Identical final status and signal snapshots are throttled to one record per symbol per minute; a changed signal identity is recorded immediately. The ledger has update/delete guards. The dashboard and panel render the same endpoint shape; their polling intervals may differ, but each individual display is internally consistent to one snapshot. This endpoint remains paper-only and does not add order execution.

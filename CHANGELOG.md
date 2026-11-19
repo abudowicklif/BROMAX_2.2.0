@@ -1,3 +1,8 @@
+## Deterministic multi-agent decision snapshot
+- Added eight typed specialist/coordinator roles that reuse existing research, calibration, volatility, quote, risk, and paper-ledger calculations; no LLM output can generate probabilities or authorize trades.
+- Added `GET /decision` as the synchronized source for the minimal dashboard and Windows floating panel, including same-tick consistency checks and fail-closed signal approval.
+- Added immutable, throttled agent-run persistence and focused tests for data quality, no-trade vetoes, persistence, and snapshot synchronization.
+
 ## 2.2.1
 - Changed the local BROMAX web/API listening port from 8000 to 8765 to avoid the previously occupied port. Updated launch command and dashboard URL.
 - Replaced the primary dashboard with a compact five-section decision terminal; retained the detailed dashboard at `/advanced`.

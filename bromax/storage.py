@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS research_snapshots_v2(
 );
 CREATE TRIGGER IF NOT EXISTS research_snapshots_v2_no_update BEFORE UPDATE ON research_snapshots_v2 BEGIN SELECT RAISE(ABORT,'versioned research snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS research_snapshots_v2_no_delete BEFORE DELETE ON research_snapshots_v2 BEGIN SELECT RAISE(ABORT,'versioned research snapshots are immutable'); END;
+CREATE TABLE IF NOT EXISTS agent_runs(
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_id TEXT NOT NULL UNIQUE,
+ created_utc TEXT NOT NULL, symbol TEXT NOT NULL, snapshot_tick_id INTEGER,
+ final_status TEXT NOT NULL, decision_key TEXT NOT NULL, agent_results_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_agent_runs_symbol_seq ON agent_runs(symbol,seq);
+CREATE TRIGGER IF NOT EXISTS agent_runs_no_update BEFORE UPDATE ON agent_runs BEGIN SELECT RAISE(ABORT,'agent runs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS agent_runs_no_delete BEFORE DELETE ON agent_runs BEGIN SELECT RAISE(ABORT,'agent runs are immutable'); END;
 CREATE TABLE IF NOT EXISTS audit_events(
  seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
  event_type TEXT NOT NULL CHECK(event_type IN ('FORECAST','SCORE','QUOTE','PAPER_OPEN','PAPER_SETTLE')),
@@ -231,6 +239,47 @@ class Store:
             if symbol: q += " AND symbol=?"; args=(symbol,)
             q += " ORDER BY seq"
             return [dict(r) for r in c.execute(q,args).fetchall()]
+
+    def quality_history(self, symbol, limit=20):
+        with self.connect() as c:
+            rows=c.execute(
+                "SELECT id,epoch,quote_text,pip_size,digit,received_utc FROM ticks WHERE symbol=? ORDER BY id DESC LIMIT ?",
+                (symbol,max(1,int(limit))),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def record_agent_run(self, snapshot_id, symbol, snapshot_tick_id, final_status, decision_key, agent_results, minimum_interval_seconds=60):
+        now=datetime.now(timezone.utc)
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            latest=c.execute(
+                "SELECT created_utc,final_status,decision_key FROM agent_runs WHERE symbol=? ORDER BY seq DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if latest and latest["final_status"]==final_status and latest["decision_key"]==decision_key:
+                previous=datetime.fromisoformat(latest["created_utc"])
+                if (now-previous).total_seconds()<minimum_interval_seconds:
+                    return False
+            c.execute(
+                "INSERT INTO agent_runs(snapshot_id,created_utc,symbol,snapshot_tick_id,final_status,decision_key,agent_results_json) VALUES(?,?,?,?,?,?,?)",
+                (snapshot_id,now.isoformat(),symbol,snapshot_tick_id,final_status,decision_key,json.dumps(agent_results,separators=(",",":"),default=str)),
+            )
+            return True
+
+    def agent_runs(self, symbol, limit=20):
+        with self.connect() as c:
+            rows=c.execute(
+                "SELECT seq,snapshot_id,created_utc,symbol,snapshot_tick_id,final_status,decision_key,agent_results_json "
+                "FROM agent_runs WHERE symbol=? ORDER BY seq DESC LIMIT ?",
+                (symbol,max(1,int(limit))),
+            ).fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            item["agent_results"]=json.loads(item.pop("agent_results_json"))
+            result.append(item)
+        return result
+
     def ticks_frame(self, symbol):
         import pandas as pd
         with self.connect() as c:
