@@ -3,245 +3,458 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BROMAX — Decision Terminal</title>
+<meta name="theme-color" content="#090e12">
+<title>BROMAX - Signal Desk</title>
 <style>
-:root{color-scheme:dark;--bg:#0d1215;--panel:#151d21;--panel2:#1a2429;--line:#2b383d;--text:#e7efec;--muted:#91a19d;--green:#73d39a;--red:#f07c7c;--amber:#e4bd70;--blue:#8eb8c9;--mono:ui-monospace,Consolas,monospace;--sans:Inter,"Segoe UI",Arial,sans-serif}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.35 var(--sans);font-variant-numeric:tabular-nums}button,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:7px 10px}a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.topbar{height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid var(--line);background:#11181b}.brand{font-weight:750;letter-spacing:.13em}.brand small{color:var(--muted);font-weight:500;letter-spacing:.02em}.tools{display:flex;align-items:center;gap:14px}.tools select{min-width:145px}.shell{max-width:1320px;margin:0 auto;padding:13px 18px 18px;display:grid;gap:11px}.section{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:11px 13px;min-width:0}.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.section-title h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:700}.market{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.market-item{min-width:0}.label{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}.value{font:600 15px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{display:inline-flex;align-items:center;gap:7px;font:700 11px var(--mono);letter-spacing:.04em}.light{width:8px;height:8px;border-radius:50%;background:#69757a}.status.good{color:var(--green)}.status.good .light{background:var(--green)}.status.bad{color:var(--red)}.status.bad .light{background:var(--red)}.status.warn{color:var(--amber)}.status.warn .light{background:var(--amber)}.signal{border-color:#496b58;background:linear-gradient(110deg,#18251f,#151d21 62%);padding:13px 15px}.signal .section-title{margin-bottom:10px}.signal .section-title h2{color:#b4c6bc}.signal-grid{display:grid;grid-template-columns:1.15fr repeat(5,minmax(100px,.7fr));gap:10px;align-items:center}.signal-digit{font:700 56px/.9 var(--mono);color:var(--green)}.signal-digit.empty{font:700 20px var(--sans);color:var(--red);letter-spacing:.02em;line-height:1.2}.signal-item .value{font-size:16px}.trade-pill{display:inline-block;padding:6px 11px;border:1px solid var(--line);border-radius:4px;font:700 12px var(--mono);letter-spacing:.06em;white-space:nowrap}.trade-pill.trade{color:var(--green);border-color:#4d8c65;background:#173122}.trade-pill.no-trade{color:var(--red);border-color:#754949;background:#301c1d}.digit-wrap{overflow:auto;max-height:335px}table{width:100%;border-collapse:collapse;min-width:720px}th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:650;padding:7px 9px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}td{padding:6px 9px;border-bottom:1px solid #222d31;font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td.num{font-family:var(--mono);white-space:nowrap}.digit-cell{font:700 14px var(--mono)}.row-trade{background:#14251c}.row-trade .digit-cell,.decision-trade{color:var(--green);font-weight:750}.decision-no{color:var(--red);font-weight:700}.reason{color:var(--muted);font-size:11px;max-width:540px;white-space:normal}.bottom{display:grid;grid-template-columns:1fr 1.4fr;gap:11px}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 12px}.summary-grid .value{font-size:14px}.muted{color:var(--muted)}.good-text{color:var(--green)}.bad-text{color:var(--red)}.warn-text{color:var(--amber)}.note{color:var(--muted);font-size:10px;margin:8px 0 0}.updated{color:var(--muted);font-size:10px;text-align:right}.error{color:var(--red)}.ops-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.ops-grid .value{font-size:13px}.history-wrap{overflow:auto;max-height:230px;margin-top:8px}.history-table{min-width:600px}.last-error{margin:8px 0 0;color:var(--red);overflow-wrap:anywhere}@media(max-width:850px){.signal-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.signal-primary{grid-column:span 3}.bottom{grid-template-columns:1fr}.shell{padding:10px}.market{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.topbar{padding:0 10px}.brand small{display:none}.tools{gap:7px}.tools select{min-width:0;width:118px}.shell{gap:8px;padding:8px}.section{padding:9px}.market{gap:8px}.signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.signal-primary{grid-column:span 2}.signal-digit{font-size:44px}.signal-item .value{font-size:14px}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.updated{display:none}}
- .trade-pill.pending{color:var(--amber);border-color:#816c3d;background:#2c281e}.trade-pill.research{color:var(--blue);border-color:#496b58;background:#18242a}
+:root{
+  color-scheme:dark;
+  --bg:#090e12;
+  --panel:#111a20;
+  --panel-raised:#152128;
+  --line:rgba(167,190,198,.13);
+  --text:#edf5f4;
+  --muted:#91a5a9;
+  --faint:#61747a;
+  --mint:#6ce0b1;
+  --blue:#80c8dc;
+  --amber:#f0c77a;
+  --red:#ff8585;
+  --mono:ui-monospace,"SFMono-Regular",Consolas,monospace;
+  --sans:Inter,"Segoe UI",Arial,sans-serif;
+}
+*{box-sizing:border-box}
+body{
+  min-width:320px;
+  margin:0;
+  color:var(--text);
+  background:
+    radial-gradient(ellipse at 83% 0,rgba(40,103,116,.15),transparent 34rem),
+    radial-gradient(ellipse at 8% 30%,rgba(30,77,66,.11),transparent 32rem),
+    var(--bg);
+  font:14px/1.5 var(--sans);
+  font-variant-numeric:tabular-nums;
+}
+button,select{font:inherit}
+a{color:inherit;text-decoration:none}
+.topbar{
+  min-height:68px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px;
+  padding:0 max(24px,calc((100vw - 1200px)/2));
+  border-bottom:1px solid var(--line);
+  background:rgba(9,14,18,.78);
+  backdrop-filter:blur(16px);
+}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-mark{
+  width:34px;height:34px;display:grid;place-items:center;
+  border:1px solid rgba(108,224,177,.3);border-radius:10px;
+  background:linear-gradient(145deg,rgba(108,224,177,.17),rgba(128,200,220,.05));
+  color:var(--mint);font:700 14px var(--mono);letter-spacing:-.08em;
+}
+.brand-name{font-size:13px;font-weight:800;letter-spacing:.17em}
+.brand-caption{display:block;color:var(--muted);font-size:10px;letter-spacing:.12em;margin-top:1px}
+.top-tools{display:flex;align-items:center;gap:12px}
+.connection-chip,.mode-chip{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:7px 10px;border:1px solid var(--line);border-radius:999px;
+  color:var(--muted);font:700 10px var(--mono);letter-spacing:.08em;
+}
+.connection-chip i,.status-light{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.connection-chip.good{color:var(--mint);border-color:rgba(108,224,177,.22)}
+.connection-chip.good i{background:var(--mint);box-shadow:0 0 12px rgba(108,224,177,.7)}
+.connection-chip.warn{color:var(--amber)}
+.connection-chip.warn i{background:var(--amber)}
+.connection-chip.bad{color:var(--red)}
+.connection-chip.bad i{background:var(--red)}
+.mode-chip{color:#bbd7df;background:rgba(128,200,220,.06)}
+.tools select{
+  min-width:112px;padding:8px 30px 8px 11px;
+  color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:9px;
+}
+.advanced-link{color:var(--muted);font-size:12px;transition:color .18s ease}
+.advanced-link:hover{color:var(--text)}
+.layout{width:min(1200px,100%);margin:0 auto;padding:38px 24px 30px}
+.page-heading{
+  display:flex;align-items:flex-end;justify-content:space-between;gap:20px;
+  margin-bottom:22px;
+}
+.eyebrow{margin:0 0 8px;color:var(--mint);font:700 10px var(--mono);letter-spacing:.16em;text-transform:uppercase}
+h1{margin:0;font-size:clamp(28px,4vw,40px);font-weight:650;letter-spacing:-.045em;line-height:1.05}
+.subtitle{margin:9px 0 0;color:var(--muted);font-size:13px}
+.updated{text-align:right;color:var(--muted);font-size:11px}
+.updated strong{display:block;margin-top:4px;color:var(--text);font:600 12px var(--mono)}
+.market-strip{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+  overflow:hidden;margin-bottom:16px;
+  border:1px solid var(--line);border-radius:14px;
+  background:linear-gradient(110deg,rgba(21,33,40,.92),rgba(17,26,32,.88));
+}
+.market-metric{min-width:0;padding:16px 19px}
+.market-metric+.market-metric{border-left:1px solid var(--line)}
+.metric-label,.field-label{
+  display:block;margin-bottom:6px;color:var(--muted);
+  font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+}
+.metric-value{display:block;overflow:hidden;color:var(--text);font:600 14px var(--mono);text-overflow:ellipsis;white-space:nowrap}
+.metric-sub{display:block;margin-top:4px;color:var(--faint);font-size:10px}
+.workspace{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.8fr);gap:16px}
+.card{
+  min-width:0;border:1px solid var(--line);border-radius:16px;
+  background:linear-gradient(145deg,rgba(21,33,40,.98),rgba(15,23,28,.98));
+  box-shadow:0 18px 48px rgba(0,0,0,.17);
+}
+.candidate-card{
+  position:relative;overflow:hidden;min-height:402px;padding:26px 28px;
+  border-color:rgba(108,224,177,.2);
+  background:
+    radial-gradient(circle at 90% 15%,rgba(108,224,177,.12),transparent 19rem),
+    linear-gradient(145deg,#14251f,#101a1f 65%);
+}
+.candidate-card:after{
+  position:absolute;right:-72px;bottom:-170px;width:340px;height:340px;
+  border:1px solid rgba(108,224,177,.09);border-radius:50%;content:"";pointer-events:none;
+  box-shadow:0 0 0 35px rgba(108,224,177,.018),0 0 0 72px rgba(108,224,177,.014);
+}
+.card-top{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.card-title{margin:0;color:#c3d6d2;font-size:11px;font-weight:750;letter-spacing:.12em;text-transform:uppercase}
+.badge{
+  display:inline-flex;align-items:center;gap:7px;min-height:28px;padding:5px 10px;
+  border:1px solid var(--line);border-radius:999px;color:var(--amber);
+  background:rgba(240,199,122,.07);font:700 10px var(--mono);letter-spacing:.06em;
+}
+.badge:before{width:6px;height:6px;border-radius:50%;background:currentColor;content:""}
+.badge.good{color:var(--mint);border-color:rgba(108,224,177,.25);background:rgba(108,224,177,.07)}
+.badge.bad{color:var(--red);border-color:rgba(255,133,133,.25);background:rgba(255,133,133,.07)}
+.candidate-main{position:relative;z-index:1;display:grid;grid-template-columns:minmax(160px,.8fr) minmax(190px,1fr);align-items:center;gap:24px;margin:27px 0 24px}
+.digit-block{min-width:0}
+.digit-caption{display:block;margin-bottom:7px;color:var(--muted);font-size:11px;letter-spacing:.03em}
+.candidate-digit{
+  display:block;color:var(--mint);font:650 clamp(88px,12vw,138px)/.92 var(--mono);
+  letter-spacing:-.1em;text-shadow:0 0 40px rgba(108,224,177,.13);
+}
+.candidate-digit.empty{max-width:100%;color:#829496;font:650 clamp(18px,2.4vw,24px)/1.25 var(--sans);letter-spacing:-.02em;text-shadow:none}
+.candidate-copy{max-width:310px}
+.candidate-copy h2{margin:0 0 8px;font-size:22px;font-weight:600;letter-spacing:-.035em}
+.candidate-copy p{margin:0;color:var(--muted);font-size:12px;line-height:1.65}
+.candidate-metrics{
+  position:relative;z-index:1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));
+  border-top:1px solid rgba(190,219,207,.12);padding-top:17px;
+}
+.candidate-metric{min-width:0;padding:0 14px}
+.candidate-metric:first-child{padding-left:0}
+.candidate-metric+.candidate-metric{border-left:1px solid rgba(190,219,207,.1)}
+.candidate-metric .metric-value{font-size:15px}
+.candidate-metric .metric-sub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.integrity-card{padding:24px}
+.integrity-intro{margin:7px 0 20px;color:var(--muted);font-size:12px;line-height:1.6}
+.integrity-list{display:grid;gap:0}
+.integrity-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;border-top:1px solid var(--line)}
+.integrity-row:first-child{border-top:0}
+.integrity-label{display:flex;align-items:center;gap:10px;min-width:0;color:#cbd9d9;font-size:12px}
+.status-light{flex:none}
+.integrity-value{flex:none;color:var(--muted);font:700 10px var(--mono);letter-spacing:.05em;text-align:right}
+.integrity-value.good{color:var(--mint)}
+.integrity-value.pending{color:var(--amber)}
+.integrity-value.bad{color:var(--red)}
+.status-light.good{background:var(--mint);box-shadow:0 0 10px rgba(108,224,177,.55)}
+.status-light.pending{background:var(--amber)}
+.status-light.bad{background:var(--red)}
+.metric-value.good{color:var(--mint)}
+.metric-value.bad{color:var(--red)}
+.integrity-foot{
+  margin-top:17px;padding:12px 13px;border:1px solid rgba(128,200,220,.12);
+  border-radius:10px;background:rgba(128,200,220,.045);color:#a7bdc1;font-size:11px;line-height:1.55;
+}
+.system-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:18px;
+  margin-top:16px;padding:16px 19px;border:1px solid var(--line);border-radius:13px;
+  background:rgba(17,26,32,.72);
+}
+.system-message{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px}
+.system-message .status-light{background:var(--blue)}
+.execution-lock{color:var(--muted);font:700 10px var(--mono);letter-spacing:.08em;white-space:nowrap}
+.execution-lock strong{margin-left:7px;color:var(--text)}
+.error-banner{margin-top:12px;padding:11px 14px;border:1px solid rgba(255,133,133,.25);border-radius:10px;background:rgba(255,133,133,.06);color:var(--red);font-size:12px}
+.footer{display:flex;justify-content:space-between;gap:16px;margin-top:18px;color:var(--faint);font-size:10px}
+.footer span:last-child{text-align:right}
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:850px){
+  .layout{padding-top:28px}
+  .workspace{grid-template-columns:1fr}
+  .candidate-card{min-height:0}
+  .integrity-card{padding:20px 24px}
+}
+@media(max-width:600px){
+  .topbar{min-height:60px;padding:0 14px;gap:10px}
+  .brand{gap:9px}
+  .brand-mark{width:30px;height:30px}
+  .brand-name{font-size:12px}
+  .brand-caption{font-size:8px}
+  .top-tools{gap:7px}
+  .connection-chip{padding:6px 8px;font-size:9px}
+  .mode-chip,.advanced-link{display:none}
+  .tools select{min-width:92px;padding:7px 24px 7px 8px;font-size:12px}
+  .layout{padding:24px 14px 20px}
+  .page-heading{align-items:flex-start;margin-bottom:16px}
+  .page-heading .eyebrow{font-size:9px}
+  .subtitle{max-width:255px;font-size:12px}
+  .updated{padding-top:4px;font-size:9px}
+  .updated strong{font-size:10px}
+  .market-strip{grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:12px}
+  .market-metric{padding:12px 13px}
+  .market-metric:nth-child(3){border-left:0;border-top:1px solid var(--line)}
+  .market-metric:nth-child(4){border-top:1px solid var(--line)}
+  .metric-label{font-size:9px}
+  .metric-value{font-size:12px}
+  .workspace{gap:12px}
+  .candidate-card{padding:19px 18px 17px}
+  .card-title{font-size:10px}
+  .badge{min-height:26px;padding:4px 8px;font-size:9px}
+  .candidate-main{grid-template-columns:minmax(110px,.75fr) minmax(135px,1fr);gap:12px;margin:24px 0 20px}
+  .candidate-digit{font-size:88px}
+  .candidate-digit.empty{font-size:16px}
+  .candidate-copy h2{font-size:18px}
+  .candidate-copy p{font-size:11px}
+  .candidate-metric{padding:0 9px}
+  .candidate-metric .metric-label{font-size:8px}
+  .candidate-metric .metric-value{font-size:12px}
+  .candidate-metric .metric-sub{font-size:9px}
+  .integrity-card{padding:18px}
+  .integrity-intro{margin-bottom:12px}
+  .integrity-row{padding:12px 0}
+  .system-bar{align-items:flex-start;flex-direction:column;gap:9px;padding:13px 15px}
+  .footer{flex-direction:column;gap:5px}
+  .footer span:last-child{text-align:left}
+}
+@media(max-width:400px){
+  .connection-chip{width:27px;height:27px;justify-content:center;padding:0}
+  .connection-chip span{display:none}
+  .market-metric{padding:10px}
+  .candidate-main{grid-template-columns:minmax(90px,.7fr) minmax(125px,1fr);gap:10px}
+  .candidate-digit{font-size:78px}
+}
+@media(prefers-reduced-motion:no-preference){
+  .candidate-digit:not(.empty){animation:signal-arrive .45s ease-out}
+  @keyframes signal-arrive{from{opacity:.3;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+}
 </style>
 </head>
 <body>
-<header class="topbar"><div class="brand">BROMAX <small> / DECISION TERMINAL · PAPER ONLY</small></div><div class="tools"><select id="symbol" aria-label="Market symbol">__SYMBOL_OPTIONS__</select><a href="/advanced">Advanced analysis</a></div></header>
-<main class="shell">
-  <section class="section" aria-labelledby="market-heading">
-    <div class="section-title"><h2 id="market-heading">Market status</h2><span class="updated" id="updatedAt">Waiting for data</span></div>
-    <div class="market">
-      <div class="market-item"><span class="label">Deriv symbol</span><strong class="value" id="marketSymbol">—</strong></div>
-      <div class="market-item"><span class="label">Connection</span><strong class="status" id="connection"><i class="light"></i><span>CONNECTING</span></strong></div>
-      <div class="market-item"><span class="label">Latest tick · digit · market time</span><strong class="value" id="latestTick">—</strong></div>
-      <div class="market-item"><span class="label">Data freshness</span><strong class="value" id="freshness">—</strong></div>
+<header class="topbar">
+  <a class="brand" href="/dashboard" aria-label="BROMAX signal desk">
+    <span class="brand-mark" aria-hidden="true">B/</span>
+    <span><span class="brand-name">BROMAX</span><span class="brand-caption">MARKET INTELLIGENCE</span></span>
+  </a>
+  <div class="top-tools">
+    <span class="connection-chip warn" id="connection"><i></i><span>CONNECTING</span></span>
+    <span class="mode-chip">PAPER ONLY</span>
+    <div class="tools"><label class="visually-hidden" for="symbol">Market symbol</label><select id="symbol" aria-label="Market symbol">__SYMBOL_OPTIONS__</select></div>
+    <a class="advanced-link" href="/advanced">Research details</a>
+  </div>
+</header>
+
+<main class="layout">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">LIVE MARKET / DIGIT MATCH</p>
+      <h1>Signal desk</h1>
+      <p class="subtitle">One combined research candidate. Live analysis continues in the background.</p>
     </div>
+    <div class="updated"><span>LAST REFRESH</span><strong id="updatedAt">Waiting for data</strong></div>
+  </div>
+
+  <section class="market-strip" aria-label="Live market overview">
+    <div class="market-metric"><span class="metric-label">Market</span><strong class="metric-value" id="marketSymbol">—</strong><span class="metric-sub">Deriv synthetic index</span></div>
+    <div class="market-metric"><span class="metric-label">Latest quote / digit</span><strong class="metric-value" id="latestTick">—</strong><span class="metric-sub" id="marketTime">Waiting for live tick</span></div>
+    <div class="market-metric"><span class="metric-label">Feed freshness</span><strong class="metric-value" id="freshness">—</strong><span class="metric-sub" id="feedDetail">Checking stream</span></div>
+    <div class="market-metric"><span class="metric-label">Strategy engines</span><strong class="metric-value" id="batchSummary">—</strong><span class="metric-sub">Equal-weight probability blend</span></div>
   </section>
 
-  <section class="section signal" aria-labelledby="signal-heading">
-    <div class="section-title"><h2 id="signal-heading">Primary research signal</h2><span id="signalStatus" class="trade-pill no-trade">NO QUALIFIED SIGNAL</span></div>
-    <div class="signal-grid">
-      <div class="signal-primary"><span class="label">Qualified digit · research only</span><div class="signal-digit empty" id="signalDigit">NO QUALIFIED SIGNAL</div></div>
-      <div class="signal-item"><span class="label">Model probability · uncalibrated</span><strong class="value" id="signalProbability">—</strong></div>
-      <div class="signal-item"><span class="label">Strategy</span><strong class="value" id="signalHealth">—</strong></div>
-      <div class="signal-item"><span class="label">Target tick</span><strong class="value" id="signalDuration">—</strong></div>
-      <div class="signal-item"><span class="label">Execution</span><strong class="value" id="signalPayout">DISABLED</strong></div>
-      <div class="signal-item"><span class="label">Signal status</span><strong class="value" id="signalEv">NO SIGNAL</strong></div>
-    </div>
-    <p class="note" id="primaryReason">A primary digit appears only when a current-tick agent result passes research gates. No signal is forced and no trade is placed.</p>
-  </section>
+  <div class="workspace">
+    <section class="card candidate-card" aria-labelledby="candidate-heading">
+      <div class="card-top">
+        <h2 class="card-title" id="candidate-heading">Combined Digit MATCH</h2>
+        <span class="badge pending" id="candidateStatus" aria-live="polite">WAITING</span>
+      </div>
+      <div class="candidate-main">
+        <div class="digit-block">
+          <span class="digit-caption">Current research candidate</span>
+          <strong class="candidate-digit empty" id="candidateDigit">Waiting for data</strong>
+        </div>
+        <div class="candidate-copy">
+          <h2 id="candidateTitle">Building the live picture</h2>
+          <p id="candidateMessage">The candidate appears when the live tick and full strategy batch are aligned.</p>
+        </div>
+      </div>
+      <div class="candidate-metrics">
+        <div class="candidate-metric"><span class="metric-label">Model probability</span><strong class="metric-value" id="candidateProbability">—</strong><span class="metric-sub">Uncalibrated estimate</span></div>
+        <div class="candidate-metric"><span class="metric-label">Target</span><strong class="metric-value" id="candidateTarget">—</strong><span class="metric-sub">Next market tick</span></div>
+        <div class="candidate-metric"><span class="metric-label">Research state</span><strong class="metric-value" id="candidateValidation">PENDING</strong><span class="metric-sub" id="candidateCorrelation">Correlation review pending</span></div>
+      </div>
+    </section>
 
-  <section class="section" aria-labelledby="pipeline-heading">
-    <div class="section-title"><h2 id="pipeline-heading">Live analysis pipeline</h2><strong class="status" id="pipelineStatus"><i class="light"></i><span>WAITING</span></strong></div>
-    <div class="ops-grid">
-      <div><span class="label">Subscription</span><strong class="value" id="subscriptionStatus">—</strong></div>
-      <div><span class="label">Analysis engine</span><strong class="value" id="analysisStatus">—</strong></div>
-      <div><span class="label">Strategy processing</span><strong class="value" id="strategyStatus">—</strong></div>
-      <div><span class="label">Signal generation</span><strong class="value" id="generationStatus">—</strong></div>
-      <div><span class="label">Last primary analysis</span><strong class="value" id="primaryAnalysisStatus">WAITING FOR DATA</strong></div>
-      <div><span class="label">Ticks received / processed</span><strong class="value" id="tickCounts">—</strong></div>
-      <div><span class="label">Forecasts generated</span><strong class="value" id="signalsRecorded">—</strong></div>
-      <div><span class="label">Missed tick epochs</span><strong class="value" id="missingTicks">—</strong></div>
-      <div><span class="label">Out-of-order / invalid / duplicate</span><strong class="value" id="badTicks">—</strong></div>
-    </div>
-    <p class="last-error" id="pipelineError" hidden></p>
-    <p class="note">Live ticks are analyzed independently of trading. No order is placed.</p>
-  </section>
+    <section class="card integrity-card" aria-labelledby="integrity-heading">
+      <p class="eyebrow">SYSTEM READINESS</p>
+      <h2 class="card-title" id="integrity-heading">Signal integrity</h2>
+      <p class="integrity-intro">The candidate is informational until its evidence is validated. It is not a trading instruction.</p>
+      <div class="integrity-list">
+        <div class="integrity-row"><span class="integrity-label"><i class="status-light" id="feedLight"></i>Live market feed</span><strong class="integrity-value pending" id="feedStatus">CHECKING</strong></div>
+        <div class="integrity-row"><span class="integrity-label"><i class="status-light" id="strategyLight"></i>Strategy batch</span><strong class="integrity-value pending" id="strategyStatus">WAITING</strong></div>
+        <div class="integrity-row"><span class="integrity-label"><i class="status-light" id="validationLight"></i>Research validation</span><strong class="integrity-value pending" id="validationStatus">PENDING</strong></div>
+        <div class="integrity-row"><span class="integrity-label"><i class="status-light"></i>Order execution</span><strong class="integrity-value">DISABLED</strong></div>
+      </div>
+      <div class="integrity-foot">All eight agents and strategy checks continue independently in the background. This screen stays focused on the combined candidate.</div>
+    </section>
+  </div>
 
-  <section class="section" aria-labelledby="digits-heading">
-    <div class="section-title"><h2 id="digits-heading">Strategy forecasts · latest tick</h2><span class="muted" id="decisionNote">All candidates are research-only; probabilities are not calibrated confidence.</span></div>
-    <div class="digit-wrap"><table>
-      <thead><tr><th>Strategy</th><th>Digit</th><th>Model probability</th><th>Classification</th><th>Trading</th></tr></thead>
-      <tbody id="digitRows"><tr><td colspan="5" class="muted">Waiting for live strategy forecasts.</td></tr></tbody>
-    </table></div>
-  </section>
-
-  <section class="section" aria-labelledby="history-heading">
-    <div class="section-title"><h2 id="history-heading">Forecast history · highest-probability candidate per tick</h2><span class="updated" id="historyUpdated">Waiting for history</span></div>
-    <div class="history-wrap"><table class="history-table">
-      <thead><tr><th>Market time</th><th>Strategy</th><th>Forecast digit</th><th>Model probability</th><th>Outcome</th></tr></thead>
-      <tbody id="signalHistory"><tr><td colspan="5" class="muted">No persisted forecasts yet.</td></tr></tbody>
-    </table></div>
-    <p class="note">This table is strategy-forecast history, not qualified primary-signal history. One highest-probability candidate is shown per tick; outcomes are recorded only when the exact next tick is observed.</p>
-  </section>
+  <div class="system-bar">
+    <div class="system-message"><i class="status-light"></i><span>Research and validation run in the background; no order is placed.</span></div>
+    <div class="execution-lock">EXECUTION<strong>DISABLED</strong></div>
+  </div>
+  <p class="error-banner" id="errorBanner" role="alert" hidden></p>
+  <footer class="footer">
+    <span>BROMAX / LIVE RESEARCH TERMINAL</span>
+    <span>Unvalidated probabilities are not calibrated and do not imply an edge.</span>
+  </footer>
 </main>
+
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
 const state={symbol:$('symbol').value};
-const historyCache=new Map();
-const HISTORY_REFRESH_MS=30000;
 const pct=value=>value==null||!Number.isFinite(Number(value))?'—':`${(Number(value)*100).toFixed(1)}%`;
-const safe=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);return response.json()}
-function renderMarket(decision){
-  const symbol=decision.symbol,market=decision.market_status||{},pipeline=decision.pipeline||{},tick=market.latest_tick;
+async function api(path){
+  const response=await fetch(path,{cache:'no-store'});
+  if(!response.ok)throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+function setIntegrity(id,lightId,text,tone){
+  const value=$(id),light=$(lightId);
+  value.textContent=text;
+  value.className=`integrity-value ${tone||''}`;
+  if(light)light.className=`status-light ${tone||''}`;
+}
+function localTime(epoch){
+  const value=Number(epoch);
+  return Number.isFinite(value)&&value>0?new Date(value*1000).toLocaleTimeString():'—';
+}
+function humanStatus(status){
+  const labels={
+    ANALYSIS_PENDING:'ANALYZING CURRENT TICK',
+    INCOMPLETE_STRATEGY_BATCH:'WAITING FOR STRATEGIES',
+    INCONSISTENT_SNAPSHOT:'SYNCING MARKET DATA',
+    INVALID_STRATEGY_OUTPUT:'CANDIDATE WITHHELD',
+    STALE_MARKET_DATA:'STALE MARKET DATA',
+    WAITING_FOR_HISTORY:'BUILDING MARKET CONTEXT',
+  };
+  return labels[status]||String(status||'WAITING').replace(/_/g,' ');
+}
+function render(health,ticks,signalData){
+  const symbol=state.symbol;
+  const pipeline=health.pipeline?.[symbol]||{};
+  const candidate=signalData.combined_candidate||{};
+  const tick=ticks[0]||health.latest?.[symbol]||null;
+  const fresh=pipeline.data_status==='RECEIVING DATA';
+  const currentTick=Boolean(tick&&candidate.observed_tick_id!=null&&Number(candidate.observed_tick_id)===Number(tick.id));
+  const candidateReady=candidate.status==='UNVALIDATED_CANDIDATE'
+    &&candidate.trade_authorized===false
+    &&candidate.execution_authorized===false
+    &&candidate.digit!=null
+    &&fresh
+    &&currentTick;
+  const status=candidateReady
+    ?'UNVALIDATED CANDIDATE'
+    :!fresh&&tick
+      ?'STALE MARKET DATA'
+      :candidate.status==='UNVALIDATED_CANDIDATE'&&!currentTick
+        ?'SYNCING MARKET TICK'
+        :humanStatus(candidate.status);
+
   $('marketSymbol').textContent=symbol;
-  const receiving=market.data_status==='RECEIVING DATA';
-  const statusText=market.connection_status||'DISCONNECTED';
-  const connection=$('connection');
-  connection.className=`status ${statusText==='CONNECTED'?(receiving?'good':'warn'):statusText==='CONNECTING'||statusText==='RECONNECTING'?'warn':'bad'}`;
-  connection.querySelector('span').textContent=statusText;
-  if(tick){
-    const age=market.freshness_seconds;
-    const tickTime=tick.epoch?new Date(Number(tick.epoch)*1000).toLocaleTimeString():'—';
-    $('latestTick').textContent=`${tick.quote_text} · ${tick.digit} · ${tickTime}`;
-    $('freshness').textContent=`${market.data_status||'STALE'} · ${age==null?'—':`${Math.floor(age)}s`}`;
-    $('freshness').className=`value ${receiving?'good-text':'bad-text'}`;
-  }else{
-    $('latestTick').textContent='—';$('freshness').textContent='NO TICK DATA';$('freshness').className='value bad-text';
-  }
-  const pipelineStatus=$('pipelineStatus');
-  const pipelineText=pipeline.pipeline_status||'WAITING';
-  const good=pipelineText==='GENERATING SIGNALS'||pipelineText==='ANALYZING'||pipelineText==='RECEIVING DATA';
-  const warn=pipelineText==='CONNECTED'||pipelineText==='CONNECTING';
-  pipelineStatus.className=`status ${good?'good':warn?'warn':'bad'}`;
-  pipelineStatus.querySelector('span').textContent=pipelineText;
-  $('subscriptionStatus').textContent=pipeline.subscription_status||'—';
-  $('analysisStatus').textContent=pipeline.analysis_status||'—';
-  $('strategyStatus').textContent=pipeline.strategy_status||'—';
-  $('generationStatus').textContent=pipeline.signal_generation_status||'—';
-  const primaryAnalysis=decision.primary_analysis||{};
-  const primaryStatus=$('primaryAnalysisStatus');
-  const analysisStatus=primaryAnalysis.status||'WAITING_FOR_DATA';
-  const analysisTick=primaryAnalysis.last_tick_id;
-  const completedStatus=['QUALIFIED','NO_QUALIFIED_SIGNAL','STALE_RESULT'].includes(analysisStatus);
-  primaryStatus.textContent=completedStatus&&analysisTick
-    ?`${analysisStatus} · TICK ${analysisTick}`
-    :analysisStatus;
-  primaryStatus.className=`value ${primaryAnalysis.status==='QUALIFIED'?'good-text':primaryAnalysis.status==='ERROR'||primaryAnalysis.status==='STALE_RESULT'?'bad-text':'warn-text'}`;
-  $('tickCounts').textContent=`${pipeline.received_ticks??0} / ${pipeline.processed_ticks??0}`;
-  $('signalsRecorded').textContent=String(pipeline.signals_generated??0);
-  $('missingTicks').textContent=String(pipeline.missing_tick_count??0);
-  $('badTicks').textContent=`${pipeline.out_of_order_ticks??0} / ${pipeline.invalid_ticks??0} / ${pipeline.duplicate_ticks??0}`;
-  const error=$('pipelineError');
-  error.textContent=pipeline.last_error||pipeline.connection_error||'';
-  error.hidden=!error.textContent;
-}
-function renderSignalHistory(data,fetchedAt){
-  const candidates=data?.signals||[];
-  const latestByEpoch=new Map();
-  for(const row of candidates){
-    const epoch=Number(row.forecast_epoch);
-    const previous=latestByEpoch.get(epoch);
-    if(!previous||Number(row.confidence??-1)>Number(previous.confidence??-1))latestByEpoch.set(epoch,row);
-  }
-  const rows=Array.from(latestByEpoch.values()).sort((left,right)=>right.forecast_epoch-left.forecast_epoch).slice(0,10);
-  $('signalHistory').innerHTML=rows.length?rows.map(row=>{
-    const time=row.forecast_epoch?new Date(Number(row.forecast_epoch)*1000).toLocaleTimeString():'—';
-    const outcome=row.status==='SCORED_HIT'?`HIT · ${row.actual_digit}`:row.status==='SCORED_MISS'?`MISS · ${row.actual_digit}`:row.status;
-    return `<tr><td class="num">${safe(time)}</td><td>${safe(row.strategy_id)}</td><td class="num">${safe(row.prediction)}</td><td class="num">${pct(row.confidence)}</td><td>${safe(outcome)}</td></tr>`;
-  }).join(''):'<tr><td colspan="5" class="muted">No persisted forecasts yet.</td></tr>';
-  $('historyUpdated').textContent=fetchedAt?`Updated ${new Date(fetchedAt).toLocaleTimeString()}`:'Waiting for history';
-}
-function renderSignal(signal,analysis){
-  const status=$('signalStatus'),hero=$('signalDigit');
-  const reasons=Array.isArray(signal?.reasons)?signal.reasons:[];
-  const qualified=signal?.status==='QUALIFIED'&&signal?.trade_authorized===false;
-  const stale=signal?.status==='STALE_MARKET_DATA'||reasons.some(reason=>/stale_market_data|stale market data/i.test(String(reason)));
-  if(!qualified){
-    const analysisStatus=analysis?.status;
-    const analyzing=analysisStatus==='ANALYZING';
-    const pending=analysisStatus==='ANALYSIS_PENDING'||analysisStatus==='WAITING_FOR_DATA';
-    status.className=`trade-pill ${stale||pending||analyzing?'pending':'no-trade'}`;
-    status.textContent=stale?'STALE MARKET DATA':analyzing?'ANALYSIS IN PROGRESS':pending?'ANALYSIS PENDING':analysisStatus==='ERROR'?'ANALYSIS ERROR':'NO QUALIFIED SIGNAL';
-    hero.className='signal-digit empty';
-    hero.textContent=stale?'STALE MARKET DATA':analyzing?'ANALYSIS IN PROGRESS':pending?'ANALYSIS PENDING':'NO QUALIFIED SIGNAL';
-    for(const id of ['signalProbability','signalHealth','signalDuration'])$(id).textContent='—';
-    $('signalPayout').textContent='DISABLED';$('signalEv').textContent='NO SIGNAL';
-    $('primaryReason').textContent=analysisStatus==='ANALYZING'
-      ?'Agent checks are running in the background. No digit is shown until they complete.'
-      :analysis?.last_error||analysis?.last_reason||reasons[0]||'Current-tick research gates have not qualified a primary digit.';
-    return;
-  }
-  status.className='trade-pill research';status.textContent='QUALIFIED · RESEARCH ONLY';
-  hero.className='signal-digit';hero.textContent=String(signal.digit);
-  $('signalProbability').textContent=pct(signal.model_probability);
-  $('signalHealth').textContent=signal.strategy_id;
-  $('signalDuration').textContent=signal.target_epoch?new Date(Number(signal.target_epoch)*1000).toLocaleTimeString():'NEXT TICK';
-  $('signalPayout').textContent='DISABLED';$('signalEv').textContent='NOT A TRADE';
-  $('primaryReason').textContent='Research qualification only. Probabilities are uncalibrated; no order is placed.';
-}
-function renderDigits(decision){
-  const rows=decision?.signals||[];
-  $('digitRows').innerHTML=rows.length?rows.map(row=>
-    `<tr><td>${safe(row.strategy_id)}</td><td class="num">${safe(row.predicted_digit)}</td><td class="num">${pct(row.predicted_digit_probability)}</td><td>${safe(decision.signal_current?'RESEARCH ONLY':decision.market_fresh?'ANALYSIS PENDING':'STALE · NOT CURRENT')}</td><td class="decision-no">NO TRADE</td></tr>`
-  ).join(''):'<tr><td colspan="5" class="muted">No strategy forecasts are available.</td></tr>';
+  $('connection').className=`connection-chip ${pipeline.connection_status==='CONNECTED'&&fresh?'good':pipeline.connection_status==='CONNECTING'||pipeline.connection_status==='RECONNECTING'?'warn':'bad'}`;
+  $('connection').querySelector('span').textContent=pipeline.connection_status||'DISCONNECTED';
+  $('latestTick').textContent=tick?`${tick.quote_text} / ${tick.digit}`:'—';
+  $('marketTime').textContent=tick?`Market time ${localTime(tick.epoch)}`:'Waiting for live tick';
+  const age=pipeline.freshness_seconds;
+  $('freshness').textContent=fresh?`${age==null?'LIVE':`${Math.max(0,Math.floor(age))} SEC`}`:'STALE';
+  $('freshness').className=`metric-value ${fresh?'good':'bad'}`;
+  $('feedDetail').textContent=pipeline.subscription_status||'Subscription pending';
+  const received=candidate.contributing_strategy_count??0;
+  const expected=candidate.expected_strategy_count??10;
+  $('batchSummary').textContent=`${received} / ${expected}`;
+  $('candidateStatus').textContent=status;
+  $('candidateStatus').className=`badge ${candidateReady?'good':status==='STALE MARKET DATA'||status==='CANDIDATE WITHHELD'?'bad':'pending'}`;
+  const digit=$('candidateDigit');
+  digit.className=`candidate-digit ${candidateReady?'':'empty'}`;
+  digit.textContent=candidateReady?String(candidate.digit):status;
+  $('candidateTitle').textContent=candidateReady?'Candidate only - validation pending':status==='STALE MARKET DATA'?'Waiting for fresh data':'Preparing combined candidate';
+  $('candidateMessage').textContent=candidateReady
+    ?candidate.reason||'All strategy vectors are combined equally. The candidate is unvalidated and cannot authorize a trade.'
+    :candidate.reason||'A digit is shown only when the feed, complete strategy batch, and current tick are aligned.';
+  $('candidateProbability').textContent=candidateReady?pct(candidate.model_probability):'—';
+  $('candidateTarget').textContent=candidateReady?localTime(candidate.target_epoch):'—';
+  $('candidateValidation').textContent=candidate.validation_status||'PENDING';
+  $('candidateCorrelation').textContent=`Correlation ${String(candidate.correlation_status||'PENDING').toLowerCase()}`;
+
+  setIntegrity('feedStatus','feedLight',fresh?'RECEIVING':'WAITING',fresh?'good':tick?'bad':'pending');
+  const complete=received>0&&received===expected;
+  setIntegrity('strategyStatus','strategyLight',complete?'10 / 10 READY':`${received} / ${expected} READY`,complete?'good':'pending');
+  const validated=candidate.validation_status==='VALIDATED';
+  setIntegrity('validationStatus','validationLight',validated?'VALIDATED':'PENDING',validated?'good':'pending');
+  $('updatedAt').textContent=new Date().toLocaleTimeString();
+  $('errorBanner').hidden=true;
 }
 function renderUnavailable(error){
-  const connection=$('connection');connection.className='status bad';connection.querySelector('span').textContent='API ERROR';
-  const pipelineStatus=$('pipelineStatus');pipelineStatus.className='status bad';pipelineStatus.querySelector('span').textContent='ERROR';
-  for(const id of ['subscriptionStatus','analysisStatus','strategyStatus','generationStatus','primaryAnalysisStatus','tickCounts','signalsRecorded','missingTicks','badTicks'])$(id).textContent='—';
-  $('pipelineError').textContent=`API unavailable: ${error.message}`;$('pipelineError').hidden=false;
-  $('signalHistory').innerHTML=`<tr><td colspan="5" class="error">Signal history unavailable: ${safe(error.message)}</td></tr>`;
-  $('latestTick').textContent='—';$('freshness').textContent='UNAVAILABLE';$('freshness').className='value bad-text';
-  $('signalStatus').className='trade-pill no-trade';$('signalStatus').textContent='API ERROR';
-  $('signalDigit').className='signal-digit empty';$('signalDigit').textContent='NO LIVE FORECAST';
-  $('primaryReason').textContent=`Primary signal unavailable: ${error.message}`;
-  $('historyUpdated').textContent='History unavailable';
-  for(const id of ['signalProbability','signalHealth','signalDuration','signalPayout','signalEv'])$(id).textContent='—';
-  $('digitRows').innerHTML=`<tr><td colspan="5" class="error">API unavailable: ${safe(error.message)}</td></tr>`;
+  $('connection').className='connection-chip bad';
+  $('connection').querySelector('span').textContent='API ERROR';
+  $('marketSymbol').textContent=state.symbol;
+  $('latestTick').textContent='—';
+  $('marketTime').textContent='Market data unavailable';
+  $('freshness').textContent='UNAVAILABLE';
+  $('freshness').className='metric-value bad';
+  $('feedDetail').textContent='Unable to read market status';
+  $('batchSummary').textContent='—';
+  $('candidateStatus').textContent='API ERROR';
+  $('candidateStatus').className='badge bad';
+  $('candidateDigit').className='candidate-digit empty';
+  $('candidateDigit').textContent='NO LIVE DATA';
+  $('candidateTitle').textContent='Signal desk unavailable';
+  $('candidateMessage').textContent='The API could not be reached. The screen will retry automatically.';
+  $('candidateProbability').textContent='—';
+  $('candidateTarget').textContent='—';
+  $('candidateValidation').textContent='PENDING';
+  $('candidateCorrelation').textContent='Correlation pending';
+  setIntegrity('feedStatus','feedLight','UNAVAILABLE','bad');
+  setIntegrity('strategyStatus','strategyLight','WAITING','pending');
+  setIntegrity('validationStatus','validationLight','PENDING','pending');
+  $('updatedAt').textContent=`Retrying · ${new Date().toLocaleTimeString()}`;
+  $('errorBanner').textContent=`API unavailable: ${error.message}`;
+  $('errorBanner').hidden=false;
 }
 let refreshing=false;
-async function refresh(forceHistory=false){
+async function refresh(){
   if(refreshing)return;
   refreshing=true;
   try{
     const symbol=encodeURIComponent(state.symbol);
-    const cachedHistory=historyCache.get(state.symbol);
-    const shouldFetchHistory=forceHistory||!cachedHistory||Date.now()-cachedHistory.fetchedAt>=HISTORY_REFRESH_MS;
-    const historyRequest=shouldFetchHistory
-      ?api(`/signals/history?symbol=${encodeURIComponent(state.symbol)}&limit=100`)
-      :Promise.resolve(cachedHistory.data);
-    const [health,ticks,signals,primary,history]=await Promise.all([
+    const [health,ticks,signals]=await Promise.all([
       api('/health'),
       api(`/ticks/latest?symbol=${symbol}&limit=1`),
       api(`/signals?symbol=${symbol}`),
-      api(`/signals/primary?symbol=${symbol}`),
-      historyRequest
     ]);
-    if(shouldFetchHistory)historyCache.set(state.symbol,{data:history,fetchedAt:Date.now()});
-    const pipeline=health.pipeline?.[state.symbol]||{};
-    const tick=ticks[0]||null;
-    const marketFresh=pipeline.data_status==='RECEIVING DATA'&&tick!==null;
-    const signalCurrent=marketFresh&&tick!==null
-      &&Number(signals.observed_epoch)===Number(tick.epoch)
-      &&Number(signals.observed_tick_id)===Number(tick.id)
-      &&(signals.status===undefined||signals.signals?.length>0);
-    const snapshot={
-      symbol:state.symbol,
-      primary_analysis:health.primary_analysis?.[state.symbol]||{},
-      market_status:{
-        connection_status:pipeline.connection_status,
-        data_status:pipeline.data_status,
-        freshness_seconds:pipeline.freshness_seconds,
-        latest_tick:tick,
-      },
-      pipeline,
-      signals:signals.signals||[],
-      signals_status:signals.status,
-      primary_signal:primary,
-      market_fresh:marketFresh,
-      signal_current:signalCurrent,
-    };
-    renderMarket(snapshot);
-    renderSignalHistory(history,historyCache.get(state.symbol)?.fetchedAt);
-    renderSignal(snapshot.primary_signal,snapshot.primary_analysis);
-    renderDigits(snapshot);
-    $('updatedAt').textContent=`Updated ${new Date().toLocaleTimeString()}`;
+    render(health,ticks,signals);
   }catch(error){
-    renderUnavailable(error);$('updatedAt').textContent=`Update failed · ${new Date().toLocaleTimeString()}`;
+    renderUnavailable(error);
   }finally{
     refreshing=false;
   }
 }
-$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh(true)});
-refresh();setInterval(refresh,3000);
+$('symbol').addEventListener('change',event=>{state.symbol=event.target.value;refresh()});
+refresh();
+setInterval(refresh,3000);
 </script>
 </body>
 </html>

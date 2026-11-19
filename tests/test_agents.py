@@ -3,10 +3,12 @@ from datetime import datetime, timedelta, timezone
 from bromax.agents import (
     AgentResult,
     ChiefIntelligenceCoordinator,
+    ContractIntelligenceAgent,
     DataIntelligenceAgent,
     PerformanceLearningAgent,
     ProbabilityCalibrationAgent,
     _strategy_batch_summary,
+    build_combined_candidate,
     coordinate_snapshot,
     select_primary_signal,
 )
@@ -116,6 +118,93 @@ def test_strategy_batch_requires_all_registered_strategies_on_one_tick():
     assert len(partial["missing_strategy_ids"]) == 1
 
 
+def test_combined_candidate_equal_weights_all_strategy_vectors_without_authorization():
+    strategies = candidate_strategies()
+    signal_data = {
+        "symbol": "1HZ100V",
+        "status": "ready",
+        "observed_tick_id": 42,
+        "observed_epoch": 1700000042,
+        "signals": [],
+    }
+    for index, strategy in enumerate(strategies):
+        digit = 3 if index < len(strategies) // 2 else 7
+        probabilities = [0.0] * 10
+        probabilities[digit] = 1.0
+        signal_data["signals"].append({
+            "strategy_id": strategy.strategy_id,
+            "predicted_digit": digit,
+            "probabilities": probabilities,
+        })
+
+    candidate = build_combined_candidate(
+        signal_data,
+        feed_fresh=True,
+        agent_evidence={
+            "status": "PENDING",
+            "matches_candidate_tick": False,
+            "complete_agent_count": 0,
+            "required_agent_count": 8,
+        },
+    )
+
+    assert candidate["status"] == "UNVALIDATED_CANDIDATE"
+    assert candidate["digit"] == 3
+    assert candidate["model_probability"] == 0.5
+    assert candidate["probabilities"][7] == 0.5
+    assert candidate["contributing_strategy_count"] == 10
+    assert candidate["target_epoch"] == signal_data["observed_epoch"] + 1
+    assert candidate["probability_is_calibrated"] is False
+    assert candidate["validation_status"] == "PENDING"
+    assert candidate["correlation_status"] == "PENDING"
+    assert candidate["agent_evidence"]["matches_candidate_tick"] is False
+    assert candidate["trade_authorized"] is False
+    assert candidate["execution_authorized"] is False
+
+
+def test_combined_candidate_hides_digit_for_stale_inconsistent_or_incomplete_data():
+    strategies = candidate_strategies()
+    signal_data = {
+        "symbol": "1HZ100V",
+        "status": "ready",
+        "observed_tick_id": 42,
+        "observed_epoch": 1700000042,
+        "signals": [{
+            "strategy_id": strategy.strategy_id,
+            "predicted_digit": 2,
+            "probabilities": [0.1] * 10,
+        } for strategy in strategies],
+    }
+
+    stale = build_combined_candidate(signal_data, feed_fresh=False)
+    inconsistent = build_combined_candidate(
+        signal_data, feed_fresh=True, snapshot_consistent=False
+    )
+    incomplete = build_combined_candidate(
+        {**signal_data, "signals": signal_data["signals"][:-1]},
+        feed_fresh=True,
+    )
+    invalid = build_combined_candidate(
+        {
+            **signal_data,
+            "signals": [
+                {**row, "probabilities": [0.2] * 10}
+                for row in signal_data["signals"]
+            ],
+        },
+        feed_fresh=True,
+    )
+
+    assert stale["status"] == "STALE_MARKET_DATA"
+    assert inconsistent["status"] == "INCONSISTENT_SNAPSHOT"
+    assert incomplete["status"] == "INCOMPLETE_STRATEGY_BATCH"
+    assert invalid["status"] == "INVALID_STRATEGY_OUTPUT"
+    assert all(
+        candidate["digit"] is None
+        for candidate in (stale, inconsistent, incomplete, invalid)
+    )
+
+
 def test_coordination_separates_research_readiness_from_paper_quote_gates():
     strategies = candidate_strategies()
     selected_id = strategies[0].strategy_id
@@ -175,6 +264,9 @@ def test_coordination_separates_research_readiness_from_paper_quote_gates():
     assert coordinated["primary_signal"]["digit"] == 0
     assert coordinated["primary_signal"]["probability_is_calibrated"] is False
     assert coordinated["primary_signal"]["trade_authorized"] is False
+    assert coordinated["combined_candidate"]["status"] == "UNVALIDATED_CANDIDATE"
+    assert coordinated["combined_candidate"]["digit"] == 0
+    assert coordinated["combined_candidate"]["trade_authorized"] is False
     assert coordinated["decision"]["trade_authorized"] is False
 
 
@@ -262,6 +354,41 @@ def test_performance_agent_reports_only_recorded_paper_outcomes():
     assert result.metrics["net_paper_profit"] is None
 
 
+def test_contract_agent_checks_exploratory_quote_without_approving_it():
+    result=ContractIntelligenceAgent().run(
+        {
+            "eligible":False,
+            "reason":"Exploratory quote review is not an approved paper signal.",
+            "research_candidate":{
+                "predicted_digit":7,
+                "duration":1,
+                "probability":"0.2",
+                "stake":"1",
+                "payout":"8",
+                "expected_value":"0.6",
+                "forecast_epoch":100,
+                "duration_profitability_status":"RESEARCH_ONLY",
+            },
+        },
+        {
+            "digits":[{
+                "digit":7,
+                "durations":{
+                    "1":{
+                        "decision":"DO NOT TRADE",
+                        "current_quote":{"valid":True,"spot_time":100},
+                    },
+                },
+            }],
+        },
+    )
+
+    assert result.status=="REJECTED"
+    assert result.metrics["expected_value"]=="0.6"
+    assert result.metrics["quote_spot_time"]==100
+    assert any("Exploratory quote review" in reason for reason in result.reasons)
+
+
 def test_agent_run_persistence_is_immutable_and_throttled_by_decision(tmp_path):
     store = Store(str(tmp_path / "agent-runs.sqlite3"))
     agents = [{"agent_id": "chief_intelligence_coordinator", "status": "INSUFFICIENT_EVIDENCE"}]
@@ -295,3 +422,60 @@ def test_coordinator_vetoes_even_an_approved_specialist_result_on_mixed_snapshot
     assert result.status == "INSUFFICIENT_EVIDENCE"
     assert result.output["trade_authorized"] is False
     assert result.output["final_status"] == "NO TRADE — INSUFFICIENT EVIDENCE"
+
+
+def test_agent_failure_is_recorded_and_remaining_agents_still_run(monkeypatch):
+    from bromax import agents as agents_module
+
+    def fail_digit_extraction(*args, **kwargs):
+        raise RuntimeError("data agent test failure")
+
+    monkeypatch.setattr(agents_module, "extract_last_digit", fail_digit_extraction)
+    signals = [{
+        "strategy_id":strategy.strategy_id,
+        "predicted_digit":0,
+        "predicted_digit_probability":0.1,
+        "probabilities":[0.1]*10,
+    } for strategy in candidate_strategies()]
+    coordinated = coordinate_snapshot(
+        report_item={},
+        digit_analysis={
+            "digits":[
+                {"digit":digit,"estimated_win_probability":0.1,"health_percent":None}
+                for digit in range(10)
+            ],
+            "volatility_filter":{"status":"INSUFFICIENT DATA"},
+        },
+        signal_data={
+            "symbol":"1HZ100V",
+            "status":"ready",
+            "observed_tick_id":21,
+            "observed_epoch":1_700_000_021,
+            "signals":signals,
+        },
+        timing={"strategies":[]},
+        ready={"status":"WAITING","eligible":False,"reason":"No approved quote-backed signal."},
+        quality_ticks=_ticks(21),
+        feed_stale=False,
+        max_data_age_seconds=5,
+        collector_errors=[],
+        paper_events=[],
+        forecasts=[],
+        prior_runs=[],
+        consistent=True,
+    )
+
+    results={item["agent_id"]:item for item in coordinated["agents"]}
+    assert len(results)==8
+    assert results["data_intelligence"]["status"]=="ERROR"
+    assert "data agent test failure" in results["data_intelligence"]["reasons"][0]
+    assert results["probability_calibration"]["status"]=="APPROVED"
+    assert results["chief_intelligence_coordinator"]["status"]=="INSUFFICIENT_EVIDENCE"
+    assert coordinated["decision"]["trade_authorized"] is False
+    assert len(coordinated["coordination"]["handoffs"])==12
+    assert any(
+        item["from_agent"]=="probability_calibration"
+        and item["to_agent"]=="risk_signal_approval"
+        and item["result_status"]=="APPROVED"
+        for item in coordinated["coordination"]["handoffs"]
+    )

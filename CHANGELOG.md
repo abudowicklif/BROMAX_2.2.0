@@ -1,3 +1,20 @@
+## Focused signal desk
+- Replaced the detailed dashboard tables with a single combined-candidate view, compact market status, and concise signal-integrity checks.
+- Removed agent execution details, per-strategy forecasts, and forecast history from the dashboard while retaining background processing and API access.
+- The dashboard now polls only health, latest tick, and current signals; stale or mismatched candidate digits remain hidden.
+
+## Combined strategy candidate
+- Added a distinct equal-weight mean of the ten registered strategies' probability vectors for each complete, fresh, consistent tick.
+- Exposed the `UNVALIDATED_CANDIDATE` separately in `/signals`, `/decision`, and the dashboard; incomplete, invalid, stale, or inconsistent inputs do not display a candidate digit.
+- Attached agent evidence only when all eight agent results match the candidate tick; kept ensemble validation, correlation review, calibration, and trading authorization pending/disabled.
+- Added focused aggregation, tie, fail-closed data, API, and dashboard tests.
+
+## Continuous agent operation
+- Run all eight deterministic agent roles on each completed live strategy batch, even when research, data-quality, or probability evidence is pending or rejected.
+- Keep exploratory agent findings separate from validation and paper-signal qualification; preserve existing fail-closed signal and execution gates.
+- Expose per-agent execution/result/validation status, runtimes, findings, metrics, and actual in-process coordination handoffs through health and the compact dashboard.
+- Isolate and record individual agent exceptions so remaining specialists and the coordinator can complete the cycle.
+
 ## Background proposal accounting
 - Bounded concurrent optional Deriv proposal connections with the collector's existing semaphore.
 - Moved quote, paper-gate, and duration-ledger writes to a serialized worker thread so they cannot synchronously stall live tick processing.

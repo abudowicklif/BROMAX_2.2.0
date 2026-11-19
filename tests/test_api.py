@@ -35,23 +35,24 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert bridge["mode"]=="SIMULATED_ONLY"
     page=api_module.dashboard()
     assert "BROMAX" in page
-    assert "Primary research signal" in page
-    assert "Last primary analysis" in page
-    assert "primaryAnalysisStatus" in page
-    assert "NO QUALIFIED SIGNAL" in page
-    assert "QUALIFIED · RESEARCH ONLY" in page
-    assert "Top-ranked digit" not in page
-    assert "Strategy forecasts · latest tick" in page
-    assert "Live analysis pipeline" in page
-    assert "Forecast history · highest-probability candidate per tick" in page
-    assert "signalHistory" in page
-    assert page.count("<section ")==5
+    assert "Signal desk" in page
+    assert "Combined Digit MATCH" in page
+    assert "candidateDigit" in page
+    assert "Signal integrity" in page
+    assert "All eight agents and strategy checks continue independently in the background." in page
+    assert "Agent execution and evidence" not in page
+    assert "Strategy forecasts · latest tick" not in page
+    assert "Forecast history · highest-probability candidate per tick" not in page
+    assert "agent_activity" not in page
+    assert "renderAgentActivity" not in page
+    assert "signalHistory" not in page
+    assert page.count("<section ")==3
     assert "Paper trading results" not in page
     assert "Volatility check" not in page
-    assert "HISTORY_REFRESH_MS=30000" in page
+    assert "HISTORY_REFRESH_MS" not in page
     assert "/signals?symbol=" in page
-    assert "/signals/primary?symbol=" in page
-    assert "&limit=100" in page
+    assert "/signals/primary?symbol=" not in page
+    assert "/signals/history?symbol=" not in page
     assert "/health" in page
     assert "/decision?symbol=" not in page
     assert "/digits/analysis?symbol=" not in page
@@ -65,6 +66,8 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     health=api_module.health()
     assert health["pipeline"]["1HZ100V"]["connection_status"]=="DISCONNECTED"
     assert health["primary_analysis"]["1HZ100V"]["status"]=="WAITING_FOR_DATA"
+    assert health["agent_activity"]["1HZ100V"]["cycle_count"]==0
+    assert len(health["agent_activity"]["1HZ100V"]["agents"])==8
     perf=api_module.performance()
     assert perf["symbols"]["1HZ100V"]["pipeline"]["performance"]["stages_ms"]["tick_to_forecast_ms"]["sample_count"]==0
     signal_history=api_module.signal_history("1HZ100V")
@@ -76,6 +79,7 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert primary["trade_authorized"] is False
     assert api_module.intelligence("1HZ100V",100)["signal_status"]=="RESEARCH_ONLY_NOT_APPROVED"
     assert api_module.signals("1HZ100V")["trade_authorized"] is False
+    assert api_module.signals("1HZ100V")["combined_candidate"]["trade_authorized"] is False
     timing = api_module.timing_research("1HZ100V")
     assert timing["execution_authorized"] is False
     assert timing["durations_tested_ticks"] == [1, 2, 3, 4, 5]
@@ -83,7 +87,8 @@ def test_api_exposes_research_and_paper_routes_but_no_live_order_route(tmp_path,
     assert timing["payout_optimization"]["execution_authorized"] is False
 
 
-def test_background_primary_analysis_stops_at_failed_research_gate(monkeypatch,tmp_path):
+@pytest.mark.parametrize("stale_feed",[False,True])
+def test_background_primary_analysis_runs_all_agents_when_research_is_pending(monkeypatch,tmp_path,stale_feed):
     import importlib
     from datetime import datetime,timezone
     from bromax.strategies import candidate_strategies
@@ -109,16 +114,24 @@ def test_background_primary_analysis_stops_at_failed_research_gate(monkeypatch,t
         "status":"ready",
         "observed_tick_id":21,
         "observed_epoch":1_700_000_021,
-        "signals":[{"strategy_id":strategy.strategy_id} for strategy in candidate_strategies()],
+        "signals":[{
+            "strategy_id":strategy.strategy_id,
+            "predicted_digit":0,
+            "predicted_digit_probability":0.1,
+            "probabilities":[0.1]*10,
+        } for strategy in candidate_strategies()],
     }
     monkeypatch.setattr(api_module.collector,"signal_snapshot",lambda symbol:signal_data)
-    monkeypatch.setattr(api_module.collector,"last_received",{"1HZ100V":api_module.time.time()})
+    received_at=api_module.time.time()-(api_module.settings.max_data_age_seconds+1 if stale_feed else 0)
+    monkeypatch.setattr(api_module.collector,"last_received",{"1HZ100V":received_at})
     monkeypatch.setattr(api_module.store,"quality_history",lambda symbol,limit:ticks)
+    monkeypatch.setattr(api_module.store,"is_latest_tick",lambda symbol,tick_id:tick_id==21)
+    monkeypatch.setattr(api_module.store,"forecasts",lambda symbol,limit=None:[])
     monkeypatch.setattr(api_module,"_load_primary_report_item",lambda symbol:{"symbol":symbol,"digit_evidence":{}})
     monkeypatch.setattr(
         api_module,
         "unified_decision",
-        lambda symbol:pytest.fail("Full decision analysis must not run when research validation fails."),
+        lambda symbol:pytest.fail("Expensive full analysis must remain gated by approved preflight evidence."),
     )
 
     attempted=api_module._run_primary_analysis_once("1HZ100V")
@@ -128,8 +141,21 @@ def test_background_primary_analysis_stops_at_failed_research_gate(monkeypatch,t
     assert primary["status"]=="NO QUALIFIED SIGNAL"
     assert primary["digit"] is None
     assert primary["observed_tick_id"]==21
-    assert any("No development-selected strategy" in reason for reason in primary["reasons"])
-    assert api_module._primary_analysis_snapshot()["1HZ100V"]["status"]=="NO_QUALIFIED_SIGNAL"
+    assert any("strategy_research" in reason for reason in primary["reasons"])
+    expected_worker_status="STALE_RESULT" if stale_feed else "NO_QUALIFIED_SIGNAL"
+    assert api_module._primary_analysis_snapshot()["1HZ100V"]["status"]==expected_worker_status
+    activity=api_module._agent_activity_snapshot()["1HZ100V"]
+    assert activity["cycle_count"]==1
+    assert activity["complete_agent_count"]==8
+    assert activity["cycle_status"]=="COMPLETE"
+    assert activity["agents"]["strategy_research"]["execution_status"]=="EXECUTED"
+    assert activity["agents"]["strategy_research"]["validation_status"]=="RESEARCH_PENDING"
+    expected_data_status="REJECTED" if stale_feed else "APPROVED"
+    assert activity["agents"]["data_intelligence"]["result_status"]==expected_data_status
+    assert activity["agents"]["market_regime"]["metrics"]["exploratory_sample_size"]==21
+    assert all(agent["run_count"]==1 for agent in activity["agents"].values())
+    assert len(activity["coordination"]["handoffs"])==12
+    assert len(api_module.store.agent_runs("1HZ100V"))==1
 
 
 def test_background_primary_worker_polls_at_bounded_interval(monkeypatch,tmp_path):
@@ -340,6 +366,7 @@ def test_signals_delivers_only_complete_persisted_forecasts_for_latest_tick(monk
     api_module.collector=api_module.MarketCollector(
         api_module.settings,api_module.store,api_module.paperbot
     )
+    monkeypatch.setattr(api_module,"_market_feed_is_fresh",lambda symbol:True)
 
     def unexpected_query(*args,**kwargs):
         raise AssertionError("current signals must not query SQLite")
@@ -356,6 +383,10 @@ def test_signals_delivers_only_complete_persisted_forecasts_for_latest_tick(monk
     }
     assert all(row["status"]=="RESEARCH_ONLY_NOT_APPROVED" for row in result["signals"])
     assert result["trade_authorized"] is False
+    assert result["combined_candidate"]["status"]=="UNVALIDATED_CANDIDATE"
+    assert result["combined_candidate"]["digit"] is not None
+    assert result["combined_candidate"]["trade_authorized"] is False
+    assert result["combined_candidate"]["agent_evidence"]["status"]=="PENDING"
 
     newer_id=api_module.store.add_tick(
         "1HZ100V",int(latest["epoch"])+1,"1234.57",2,7,"next-tick"
@@ -366,6 +397,8 @@ def test_signals_delivers_only_complete_persisted_forecasts_for_latest_tick(monk
     assert pending["observed_tick_id"]==newer_id
     assert pending["signals"]==[]
     assert pending["trade_authorized"] is False
+    assert pending["combined_candidate"]["status"]=="ANALYSIS_PENDING"
+    assert pending["combined_candidate"]["digit"] is None
 
 
 @pytest.mark.asyncio

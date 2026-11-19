@@ -70,9 +70,15 @@ def _run(agent_id: str, evaluate: Callable[[], AgentResult]) -> AgentResult:
     started = time.perf_counter()
     try:
         result = evaluate()
-    except (KeyError, TypeError, ValueError, ArithmeticError, OverflowError) as error:
-        log.exception("Agent %s rejected malformed analysis input", agent_id)
-        result = _result(agent_id, "ERROR", "The agent could not validate its analysis input.", (str(error),))
+    except Exception as error:
+        log.exception("Agent %s failed; continuing the coordinated analysis", agent_id)
+        result = _result(
+            agent_id,
+            "ERROR",
+            "Agent execution failed; see the recorded error.",
+            (f"{type(error).__name__}: {error}",),
+            {"error_type": type(error).__name__},
+        )
     result = replace(result, duration_ms=round((time.perf_counter() - started) * 1000, 3))
     log.info("Agent %s status=%s duration_ms=%.3f", agent_id, result.status, result.duration_ms)
     return result
@@ -116,6 +122,126 @@ def _strategy_batch_summary(signal_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_combined_candidate(
+    signal_data: dict[str, Any],
+    *,
+    feed_fresh: bool,
+    snapshot_consistent: bool = True,
+    agent_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Combine the registered strategy distributions without qualifying a signal."""
+    batch = _strategy_batch_summary(signal_data)
+    epoch = batch["observed_epoch"]
+    candidate = {
+        "candidate_id": None,
+        "status": "WAITING_FOR_HISTORY",
+        "symbol": signal_data.get("symbol"),
+        "digit": None,
+        "model_probability": None,
+        "probabilities": None,
+        "aggregation_method": "equal_weight_probability_mean",
+        "contributing_strategy_count": 0,
+        "expected_strategy_count": batch["expected_count"],
+        "strategy_ids": [],
+        "observed_tick_id": batch["observed_tick_id"],
+        "observed_epoch": epoch,
+        "target_epoch": epoch + 1 if epoch is not None else None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "validation_status": "PENDING",
+        "correlation_status": "PENDING",
+        "probability_is_calibrated": False,
+        "trade_authorized": False,
+        "execution_authorized": False,
+        "reason": "Waiting for a fresh complete strategy batch.",
+    }
+    if agent_evidence is not None:
+        candidate["agent_evidence"] = agent_evidence
+
+    snapshot_status = signal_data.get("status")
+    if snapshot_status == "insufficient_history":
+        candidate["status"] = "WAITING_FOR_HISTORY"
+        return candidate
+    if snapshot_status == "analysis_pending":
+        candidate["status"] = "ANALYSIS_PENDING"
+        candidate["reason"] = "The current tick does not yet have a complete strategy batch."
+        return candidate
+    if not feed_fresh:
+        candidate["status"] = "STALE_MARKET_DATA"
+        candidate["reason"] = "A combined candidate is not current while the live feed is stale."
+        return candidate
+    if not snapshot_consistent:
+        candidate["status"] = "INCONSISTENT_SNAPSHOT"
+        candidate["reason"] = "The market tick changed while the candidate snapshot was assembled."
+        return candidate
+    if batch["status"] != "COMPLETE":
+        candidate["status"] = "INCOMPLETE_STRATEGY_BATCH"
+        candidate["reason"] = "Every registered strategy must contribute to the same tick."
+        return candidate
+
+    rows_by_id = {
+        str(row["strategy_id"]): row
+        for row in signal_data["signals"]
+        if isinstance(row, dict) and row.get("strategy_id")
+    }
+    strategy_ids = [strategy.strategy_id for strategy in candidate_strategies()]
+    vectors = []
+    strategy_predictions = []
+    invalid_strategy_ids = []
+    for strategy_id in strategy_ids:
+        row = rows_by_id[strategy_id]
+        raw_probabilities = row.get("probabilities")
+        try:
+            if not isinstance(raw_probabilities, (list, tuple)) or len(raw_probabilities) != 10:
+                raise ValueError("expected ten probabilities")
+            if any(isinstance(value, bool) for value in raw_probabilities):
+                raise ValueError("boolean probability")
+            probabilities = [float(value) for value in raw_probabilities]
+        except (TypeError, ValueError):
+            invalid_strategy_ids.append(strategy_id)
+            continue
+        if (
+            any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities)
+            or not math.isclose(math.fsum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-6)
+        ):
+            invalid_strategy_ids.append(strategy_id)
+            continue
+        vectors.append(probabilities)
+        strategy_predictions.append({
+            "strategy_id": strategy_id,
+            "predicted_digit": row.get("predicted_digit"),
+        })
+
+    if invalid_strategy_ids or len(vectors) != len(strategy_ids):
+        candidate["status"] = "INVALID_STRATEGY_OUTPUT"
+        candidate["invalid_strategy_ids"] = invalid_strategy_ids or strategy_ids
+        candidate["reason"] = "All strategy probability vectors must be finite ten-digit distributions."
+        return candidate
+
+    combined = [
+        math.fsum(vector[digit] for vector in vectors) / len(vectors)
+        for digit in range(10)
+    ]
+    total_probability = math.fsum(combined)
+    if not math.isfinite(total_probability) or total_probability <= 0:
+        candidate["status"] = "INVALID_STRATEGY_OUTPUT"
+        candidate["reason"] = "The combined probability vector is invalid."
+        return candidate
+    combined = [probability / total_probability for probability in combined]
+    digit = max(range(10), key=combined.__getitem__)
+    candidate.update({
+        "candidate_id": f"{batch['symbol']}:{batch['observed_tick_id']}:equal_weight_mean",
+        "status": "UNVALIDATED_CANDIDATE",
+        "digit": digit,
+        "model_probability": combined[digit],
+        "probabilities": combined,
+        "contributing_strategy_count": len(strategy_ids),
+        "strategy_ids": strategy_ids,
+        "strategy_predictions": strategy_predictions,
+        "reason": "Combined research candidate only; ensemble validation and correlation review are pending.",
+    })
+    return candidate
+
+
 def _coordination_summary(
     signal_data: dict[str, Any],
     results: list[AgentResult],
@@ -123,7 +249,7 @@ def _coordination_summary(
 ) -> dict[str, Any]:
     strategy_batch = _strategy_batch_summary(signal_data)
     by_id = {result.agent_id: result for result in results}
-    missing_agents = [agent_id for agent_id in RESEARCH_SELECTION_GATES if agent_id not in by_id]
+    missing_agents = [agent_id for agent_id in AGENT_ROLES if agent_id not in by_id]
     gate_statuses = {
         agent_id: by_id[agent_id].status
         for agent_id in RESEARCH_SELECTION_GATES
@@ -136,7 +262,7 @@ def _coordination_summary(
         status = "INCOMPLETE_STRATEGY_BATCH"
     elif missing_agents:
         status = "MISSING_REQUIRED_AGENT"
-    elif any(value == "ERROR" for value in gate_statuses.values()):
+    elif any(result.status == "ERROR" for result in results):
         status = "AGENT_ERROR"
     elif any(value == "REJECTED" for value in gate_statuses.values()):
         status = "REJECTED"
@@ -561,6 +687,7 @@ class MarketRegimeAgent:
                 agent_status = "INSUFFICIENT_EVIDENCE"
                 reasons = ("Current-regime validation evidence is unavailable.",)
             vol = digit_analysis.get("volatility") or {}
+            exploratory = timing.get("exploratory_diagnostics") or {}
             return _result(
                 self.agent_id, agent_status,
                 "Current regime passed its strategy-specific holdout filter." if agent_status == "APPROVED" else "Current regime does not approve a signal.",
@@ -573,6 +700,11 @@ class MarketRegimeAgent:
                     "short_term_volatility": vol.get("short_term"),
                     "long_term_volatility": vol.get("long_term"),
                     "strategies_evaluated": len(timing.get("strategies") or []),
+                    "exploratory_sample_size": exploratory.get("sample_size"),
+                    "digit_counts": exploratory.get("digit_counts"),
+                    "uniformity_diagnostic": exploratory.get("uniformity_diagnostic"),
+                    "conditional_patterns": exploratory.get("patterns"),
+                    "transition_matrix_smoothed": exploratory.get("transition_matrix_smoothed"),
                 },
             )
         return _run(self.agent_id, evaluate)
@@ -585,7 +717,8 @@ class ContractIntelligenceAgent:
 
     def run(self, ready: dict[str, Any], digit_analysis: dict[str, Any]):
         def evaluate():
-            signal = ready.get("signal") if ready.get("eligible") is True else None
+            is_ready = ready.get("eligible") is True
+            signal = ready.get("signal") if is_ready else ready.get("research_candidate")
             if not signal:
                 status = "REJECTED" if ready.get("status") in {"REJECTED", "EXPIRED"} else "INSUFFICIENT_EVIDENCE"
                 return _result(
@@ -598,6 +731,10 @@ class ContractIntelligenceAgent:
             duration_result = (row or {}).get("durations", {}).get(str(duration), {})
             quote = duration_result.get("current_quote") or {}
             reasons = []
+            if not is_ready:
+                reasons.append(
+                    ready.get("reason") or "Exploratory quote review is not an approved paper signal."
+                )
             try:
                 probability = Decimal(str(signal["probability"]))
                 stake = Decimal(str(signal["stake"]))
@@ -848,6 +985,44 @@ def coordinate_snapshot(
     coordinator_result=results[-1]
     decision=coordinator_result.output
     coordination=_coordination_summary(signal_data,results,consistent)
+    tick_id=signal_data.get("observed_tick_id")
+    coordination["handoffs"]=[
+        {
+            "from_agent":result.agent_id,
+            "to_agent":"risk_signal_approval",
+            "source_tick_id":tick_id,
+            "result_status":result.status,
+            "summary":result.summary,
+            "transport":"in_process_function_input",
+        }
+        for result in first_five
+    ]+[
+        {
+            "from_agent":result.agent_id,
+            "to_agent":"chief_intelligence_coordinator",
+            "source_tick_id":tick_id,
+            "result_status":result.status,
+            "summary":result.summary,
+            "transport":"in_process_function_input",
+        }
+        for result in specialist_results
+    ]
+    agent_evidence = {
+        "status": coordination["status"],
+        "snapshot_tick_id": tick_id,
+        "matches_candidate_tick": bool(
+            consistent and tick_id == signal_data.get("observed_tick_id")
+        ),
+        "complete_agent_count": sum(result.status != "ERROR" for result in results),
+        "required_agent_count": len(AGENT_ROLES),
+        "agent_statuses": {result.agent_id: result.status for result in results},
+    }
+    combined_candidate = build_combined_candidate(
+        signal_data,
+        feed_fresh=not feed_stale,
+        snapshot_consistent=consistent,
+        agent_evidence=agent_evidence,
+    )
     primary_signal=select_primary_signal(
         signal_data, [result.as_dict() for result in results], coordination, timestamp
     )
@@ -857,5 +1032,6 @@ def coordinate_snapshot(
         "agents":[result.as_dict() for result in results],
         "performance":performance_result.metrics,
         "coordination":coordination,
+        "combined_candidate":combined_candidate,
         "primary_signal":primary_signal,
     }

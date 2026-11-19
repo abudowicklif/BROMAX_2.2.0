@@ -1,5 +1,6 @@
 import asyncio, base64, binascii, hmac, logging, os, time
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pathlib import Path
@@ -12,9 +13,8 @@ from .storage import Store
 from .collector import MarketCollector
 from .paperbot import ExecutionInterface, PaperBot
 from .agents import (
-    DataIntelligenceAgent,
-    ProbabilityCalibrationAgent,
-    StrategyResearchAgent,
+    AGENT_ROLES,
+    build_combined_candidate,
     coordinate_snapshot,
     select_primary_signal,
 )
@@ -38,6 +38,7 @@ _timing_lock=Lock()
 _primary_signal_cache={}
 _primary_signal_lock=Lock()
 _primary_analysis_lock=Lock()
+_agent_activity_lock=Lock()
 _decision_analysis_lock=Lock()
 _PRIMARY_FULL_ANALYSIS_INTERVAL_SECONDS=60.0
 _PRIMARY_ANALYSIS_POLL_SECONDS=1.0
@@ -52,6 +53,36 @@ _primary_analysis_state={
         "last_signal_status":None,
         "last_reason":None,
         "last_error":None,
+    }
+    for symbol in settings.symbols
+}
+_agent_activity_state={
+    symbol:{
+        "cycle_count":0,
+        "last_cycle_at":None,
+        "last_tick_id":None,
+        "cycle_status":"NOT_RUN",
+        "complete_agent_count":0,
+        "agent_run_persisted":False,
+        "combined_candidate":None,
+        "coordination":{},
+        "agents":{
+            agent_id:{
+                "agent_id":agent_id,
+                "role":role,
+                "run_count":0,
+                "execution_status":"NOT_RUN",
+                "result_status":"NOT_RUN",
+                "validation_status":"NOT_EVALUATED" if agent_id=="strategy_research" else "NOT_APPLICABLE",
+                "evaluated_at":None,
+                "duration_ms":None,
+                "summary":"No agent cycle has completed yet.",
+                "reasons":[],
+                "metrics":{},
+                "output":{},
+            }
+            for agent_id,role in AGENT_ROLES.items()
+        },
     }
     for symbol in settings.symbols
 }
@@ -104,6 +135,119 @@ def _primary_analysis_snapshot():
     with _primary_analysis_lock:
         return {symbol:dict(state) for symbol,state in _primary_analysis_state.items()}
 
+def _agent_activity_snapshot():
+    with _agent_activity_lock:
+        return deepcopy(_agent_activity_state)
+
+def _agent_evidence_for_tick(symbol,tick_id):
+    activity=_agent_activity_snapshot().get(symbol,{})
+    agents=activity.get("agents",{})
+    matches_tick=(
+        tick_id is not None
+        and activity.get("last_tick_id")==tick_id
+        and all(
+            agents.get(agent_id,{}).get("source_tick_id")==tick_id
+            for agent_id in AGENT_ROLES
+        )
+    )
+    return {
+        "status":activity.get("cycle_status","NOT_RUN") if matches_tick else "PENDING",
+        "snapshot_tick_id":activity.get("last_tick_id"),
+        "matches_candidate_tick":bool(matches_tick),
+        "complete_agent_count":activity.get("complete_agent_count",0) if matches_tick else 0,
+        "required_agent_count":len(AGENT_ROLES),
+        "agent_statuses":{
+            agent_id:{
+                "execution_status":agents[agent_id].get("execution_status"),
+                "result_status":agents[agent_id].get("result_status"),
+                "validation_status":agents[agent_id].get("validation_status"),
+            }
+            for agent_id in AGENT_ROLES
+        } if matches_tick else {},
+    }
+
+def _record_agent_activity(symbol,decision,cycle_duration_ms=None,agent_run_persisted=None):
+    results={
+        result.get("agent_id"):result
+        for result in decision.get("agents",[])
+        if isinstance(result,dict) and result.get("agent_id")
+    }
+    snapshot_tick_id=decision.get("snapshot_tick_id")
+    completed=sum(
+        agent_id in results and results[agent_id].get("status")!="ERROR"
+        for agent_id in AGENT_ROLES
+    )
+    missing=[agent_id for agent_id in AGENT_ROLES if agent_id not in results]
+    has_errors=any(result.get("status")=="ERROR" for result in results.values())
+    with _agent_activity_lock:
+        state=_agent_activity_state.setdefault(symbol,{
+            "cycle_count":0,
+            "last_cycle_at":None,
+            "last_tick_id":None,
+            "cycle_status":"NOT_RUN",
+            "complete_agent_count":0,
+            "agent_run_persisted":False,
+            "combined_candidate":None,
+            "coordination":{},
+            "agents":{},
+        })
+        state.update(
+            cycle_count=state["cycle_count"]+1,
+            last_cycle_at=decision.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            last_tick_id=snapshot_tick_id,
+            cycle_status="INCOMPLETE" if missing else "COMPLETED_WITH_ERRORS" if has_errors else "COMPLETE",
+            complete_agent_count=completed,
+            missing_agents=missing,
+            agent_run_persisted=bool(agent_run_persisted),
+            cycle_duration_ms=cycle_duration_ms,
+            final_status=decision.get("final_status"),
+            primary_signal_status=(decision.get("primary_signal") or {}).get("status"),
+            combined_candidate=deepcopy(decision.get("combined_candidate")),
+            coordination=deepcopy(decision.get("coordination") or {}),
+        )
+        agents=state.setdefault("agents",{})
+        for agent_id,role in AGENT_ROLES.items():
+            result=results.get(agent_id)
+            if result is None:
+                previous=agents.get(agent_id,{})
+                previous.update(
+                    agent_id=agent_id,
+                    role=role,
+                    execution_status="MISSING",
+                    result_status="MISSING",
+                    summary="No result was returned by this agent cycle.",
+                    reasons=["The coordinator did not receive this agent's result."],
+                )
+                agents[agent_id]=previous
+                continue
+            result_status=result.get("status","UNKNOWN")
+            if agent_id=="strategy_research":
+                validation_status={
+                    "APPROVED":"VALIDATED",
+                    "INSUFFICIENT_EVIDENCE":"RESEARCH_PENDING",
+                    "REJECTED":"NOT_VALIDATED",
+                    "ERROR":"ERROR",
+                }.get(result_status,"UNKNOWN")
+            else:
+                validation_status="NOT_APPLICABLE"
+            previous=agents.get(agent_id,{})
+            previous.update({
+                "agent_id":agent_id,
+                "role":role,
+                "run_count":int(previous.get("run_count",0))+1,
+                "execution_status":"ERROR" if result_status=="ERROR" else "EXECUTED",
+                "result_status":result_status,
+                "validation_status":validation_status,
+                "evaluated_at":result.get("evaluated_at"),
+                "duration_ms":result.get("duration_ms"),
+                "summary":result.get("summary"),
+                "reasons":list(result.get("reasons") or []),
+                "metrics":deepcopy(result.get("metrics") or {}),
+                "output":deepcopy(result.get("output") or {}),
+                "source_tick_id":snapshot_tick_id,
+            })
+            agents[agent_id]=previous
+
 def _primary_failure_reason(primary):
     reasons=[str(reason) for reason in primary.get("reasons") or []]
     return next(
@@ -138,45 +282,214 @@ def _load_primary_report_item(symbol):
         {},
     )
 
-def _publish_blocked_primary(
-    symbol,signal_data,agent_results,status,worker_status="NO_QUALIFIED_SIGNAL"
-):
-    tick_id=signal_data.get("observed_tick_id")
-    epoch=signal_data.get("observed_epoch")
-    primary=select_primary_signal(
-        signal_data,
-        [result.as_dict() for result in agent_results],
-        {
-            "status":status,
-            "selection_ready":False,
-            "snapshot_tick_id":tick_id,
-            "snapshot_epoch":epoch,
+def _run_live_agent_cycle(symbol,signal_data,quality_ticks,feed_stale):
+    started=time.perf_counter()
+    report_item=_load_primary_report_item(symbol) or {}
+    evidence=report_item.get("digit_evidence") or {}
+    strategy_id=evidence.get("selected_strategy_id") or report_item.get("selected_strategy_id")
+    forecasts_by_id={
+        str(row.get("strategy_id")):row
+        for row in (signal_data.get("signals") or [])
+        if isinstance(row,dict) and row.get("strategy_id")
+    }
+    selected_forecast=forecasts_by_id.get(str(strategy_id)) if strategy_id else None
+    probabilities=(selected_forecast or {}).get("probabilities") or []
+    evidence_by_digit={}
+    for row in evidence.get("digits") or []:
+        try:
+            evidence_by_digit[int(row["digit"])]=row
+        except (KeyError,TypeError,ValueError):
+            continue
+
+    recent_ticks=[]
+    for row in store.quality_history(symbol,1000):
+        try:
+            digit=int(row["digit"])
+        except (KeyError,TypeError,ValueError):
+            continue
+        if digit in range(10):
+            recent_ticks.append(row)
+    market_diagnostics=analyze_ticks(recent_ticks,symbol,1000)
+    market_state=market_diagnostics.get("market_state") or {}
+    digit_rows=[]
+    for digit in range(10):
+        evidence_row=evidence_by_digit.get(digit,{})
+        validation=evidence_row.get("validation") or {}
+        probability=probabilities[digit] if len(probabilities)==10 else None
+        digit_rows.append({
+            "digit":digit,
+            "estimated_win_probability":probability,
+            "health_percent":evidence_row.get("health_score"),
+            "validation":validation,
+            "durations":{
+                str(duration):{
+                    "decision":"DO NOT TRADE",
+                    "current_quote":{"valid":False,"spot_time":None},
+                }
+                for duration in (1,2,3,4,5)
+            },
+        })
+
+    current_forecasts=store.forecasts(symbol,limit=20)
+    latest_epoch=signal_data.get("observed_epoch")
+    current_selected=next(
+        (
+            row for row in current_forecasts
+            if str(row.get("strategy_id"))==str(strategy_id)
+            and row.get("forecast_epoch") is not None
+            and int(row["forecast_epoch"])==int(latest_epoch)
+        ),
+        None,
+    ) if strategy_id and latest_epoch is not None else None
+    ready={
+        "status":"RESEARCH_ONLY",
+        "eligible":False,
+        "reason":"The background cycle checks exploratory quotes; this is not an approved paper signal.",
+        "approved_strategy_ids":[],
+    }
+    if current_selected is not None:
+        prediction=int(current_selected["prediction"])
+        quote=store.duration_quote(current_selected["seq"],1)
+        quote_spot_time=None
+        if quote:
+            try:
+                quote_spot_time=int(quote.get("quote_spot_time"))
+            except (TypeError,ValueError):
+                quote_spot_time=None
+        quote_data={
+            "valid":bool(
+                quote
+                and quote_spot_time==int(current_selected["forecast_epoch"])
+                and not feed_stale
+            ),
+            "spot_time":quote_spot_time,
+            "stake":quote.get("stake") if quote else None,
+            "payout":quote.get("payout") if quote else None,
+        }
+        digit_rows[prediction]["durations"]["1"]["current_quote"]=quote_data
+        vector=current_selected.get("probabilities") or []
+        probability=vector[prediction] if len(vector)==10 else None
+        expected_value=None
+        if quote and probability is not None:
+            try:
+                expected_value=str(
+                    Decimal(str(probability))*Decimal(str(quote["payout"]))
+                    -Decimal(str(quote["stake"]))
+                )
+            except (InvalidOperation,KeyError,TypeError,ValueError,ArithmeticError):
+                expected_value=None
+        ready["research_candidate"]={
+            "predicted_digit":prediction,
+            "duration":1,
+            "probability":str(probability) if probability is not None else None,
+            "stake":quote.get("stake") if quote else None,
+            "payout":quote.get("payout") if quote else None,
+            "expected_value":expected_value,
+            "forecast_epoch":int(current_selected["forecast_epoch"]),
+            "duration_profitability_status":"RESEARCH_ONLY",
+        }
+
+    digit_analysis={
+        "digits":digit_rows,
+        "volatility_filter":{
+            "status":"INSUFFICIENT DATA",
+            "regime":None,
+            "health_percent":None,
+            "checks_passed":0,
+            "checks_total":0,
         },
+        "volatility":{
+            "short_term":market_state.get("mean_absolute_return_last_100"),
+            "long_term":market_state.get("mean_absolute_return_full_window"),
+        },
+    }
+    timing={
+        "strategies":[],
+        "current_volatility_regime":None,
+        "current_volatility":market_state.get("mean_absolute_return_last_100"),
+        "short_term_volatility":market_state.get("mean_absolute_return_last_100"),
+        "long_term_volatility":market_state.get("mean_absolute_return_full_window"),
+        "exploratory_diagnostics":{
+            "sample_size":market_diagnostics.get("sample_size"),
+            "digit_counts":market_diagnostics.get("digit_counts"),
+            "uniformity_diagnostic":market_diagnostics.get("uniformity_diagnostic"),
+            "patterns":market_diagnostics.get("patterns"),
+            "transition_matrix_smoothed":market_diagnostics.get("transition_matrix_smoothed"),
+        },
+    }
+    tick_id=signal_data.get("observed_tick_id")
+    latest_ticks=store.quality_history(symbol,1)
+    try:
+        latest_epoch=int(latest_ticks[-1]["epoch"]) if latest_ticks else None
+        observed_epoch=int(signal_data["observed_epoch"])
+    except (KeyError,TypeError,ValueError):
+        latest_epoch=observed_epoch=None
+    consistent=bool(
+        tick_id is not None
+        and latest_epoch is not None
+        and observed_epoch is not None
+        and store.is_latest_tick(symbol,tick_id)
+        and latest_epoch==observed_epoch
+    )
+    timestamp=datetime.now(timezone.utc).isoformat()
+    coordinated=coordinate_snapshot(
+        report_item=report_item,
+        digit_analysis=digit_analysis,
+        signal_data=signal_data,
+        timing=timing,
+        ready=ready,
+        quality_ticks=quality_ticks,
+        feed_stale=feed_stale,
+        max_data_age_seconds=settings.max_data_age_seconds,
+        collector_errors=collector.errors,
+        paper_events=store.paper_events(symbol),
+        forecasts=store.forecasts(symbol,limit=500),
+        prior_runs=store.agent_runs(symbol,limit=20),
+        consistent=consistent,
+        snapshot_timestamp=timestamp,
+    )
+    decision={
+        "created_at":timestamp,
+        "snapshot_tick_id":tick_id,
+        "final_status":coordinated["decision"].get("final_status"),
+        "agents":coordinated["agents"],
+        "coordination":coordinated["coordination"],
+        "combined_candidate":coordinated["combined_candidate"],
+        "primary_signal":coordinated["primary_signal"],
+    }
+    decision_key="|".join((
+        str(decision["final_status"]),
+        str(decision["primary_signal"].get("status")),
+        str(decision["primary_signal"].get("strategy_id")),
+        str(decision["primary_signal"].get("digit")),
+        "|".join(
+            f"{item.get('agent_id')}:{item.get('status')}"
+            for item in coordinated["agents"]
+        ),
+    ))
+    persisted=store.record_agent_run(
+        snapshot_id=str(uuid4()),
+        symbol=symbol,
+        snapshot_tick_id=tick_id,
+        final_status=decision["final_status"] or "NO TRADE — INSUFFICIENT EVIDENCE",
+        decision_key=decision_key,
+        agent_results=coordinated["agents"],
+    )
+    _record_agent_activity(
+        symbol,
+        decision,
+        cycle_duration_ms=round((time.perf_counter()-started)*1000,3),
+        agent_run_persisted=persisted,
     )
     with _primary_signal_lock:
-        _primary_signal_cache[symbol]=primary
-    _set_primary_analysis_state(
-        symbol,
-        worker_status,
-        last_completed_at=datetime.now(timezone.utc).isoformat(),
-        last_tick_id=tick_id,
-        last_checked_tick_id=tick_id,
-        last_signal_status=primary["status"],
-        last_reason=_primary_failure_reason(primary),
-        last_error=None,
-    )
-    return True
+        _primary_signal_cache[symbol]=coordinated["primary_signal"]
+    return coordinated
 
 def _run_primary_analysis_once(symbol):
     tick_id=None
     full_analysis_started=False
     try:
         signal_data=collector.signal_snapshot(symbol)
-        if not _market_feed_is_fresh(symbol):
-            _set_primary_analysis_state(
-                symbol,"WAITING_FOR_DATA",last_reason="Waiting for fresh live market data."
-            )
-            return False
         if signal_data.get("status") in {"analysis_pending","insufficient_history"}:
             _set_primary_analysis_state(
                 symbol,
@@ -200,117 +513,49 @@ def _run_primary_analysis_once(symbol):
             last_error=None,
         )
         quality_ticks=store.quality_history(symbol,21)
-        data_result=DataIntelligenceAgent().run(
-            quality_ticks,
-            feed_stale=not _market_feed_is_fresh(symbol),
-            max_age_seconds=settings.max_data_age_seconds,
-            errors=collector.errors,
+        feed_stale=not _market_feed_is_fresh(symbol)
+        coordinated=_run_live_agent_cycle(
+            symbol,signal_data,quality_ticks,feed_stale
         )
-        if data_result.status!="APPROVED":
-            return _publish_blocked_primary(
-                symbol,signal_data,[data_result],"DATA_QUALITY_BLOCKED"
-            )
-
-        report_item=_load_primary_report_item(symbol)
-        if report_item is None:
-            _set_primary_analysis_state(
-                symbol,
-                "WAITING_FOR_RESEARCH_REPORT",
-                last_completed_at=datetime.now(timezone.utc).isoformat(),
-                last_tick_id=tick_id,
-                last_checked_tick_id=tick_id,
-                last_reason="No saved research report is available; full report generation is not run in the background.",
-            )
-            return True
-        research_result=StrategyResearchAgent().run(report_item)
-        if research_result.status!="APPROVED":
-            return _publish_blocked_primary(
-                symbol,
-                signal_data,
-                [data_result,research_result],
-                "RESEARCH_NOT_APPROVED",
-            )
-
-        strategy_id=research_result.metrics.get("selected_strategy_id")
-        model=next(
-            (
-                row for row in signal_data.get("signals",[])
-                if isinstance(row,dict) and row.get("strategy_id")==strategy_id
-            ),
-            None,
+        primary=coordinated["primary_signal"]
+        statuses={
+            result.get("agent_id"):result.get("status")
+            for result in coordinated["agents"]
+        }
+        full_analysis_eligible=all(
+            statuses.get(agent_id)=="APPROVED"
+            for agent_id in ("data_intelligence","strategy_research","probability_calibration")
         )
-        probabilities=(model or {}).get("probabilities") or []
-        evidence_rows=(report_item.get("digit_evidence") or {}).get("digits") or []
-        evidence_by_digit={int(row["digit"]):row for row in evidence_rows}
-        digit_analysis={"digits":[
-            {
-                "digit":digit,
-                "estimated_win_probability":probabilities[digit] if len(probabilities)==10 else None,
-                "health_percent":evidence_by_digit.get(digit,{}).get("health_score"),
-                "validation":evidence_by_digit.get(digit,{}).get("validation") or {},
-            }
-            for digit in range(10)
-        ]}
-        probability_result=ProbabilityCalibrationAgent().run(digit_analysis,signal_data)
-        if probability_result.status!="APPROVED":
-            return _publish_blocked_primary(
-                symbol,
-                signal_data,
-                [data_result,research_result,probability_result],
-                "PROBABILITY_CHECK_BLOCKED",
-            )
+        if full_analysis_eligible:
+            with _primary_analysis_lock:
+                last_full_analysis=_last_primary_full_analysis_at.get(symbol)
+                now_monotonic=time.monotonic()
+                full_analysis_throttled=(
+                    last_full_analysis is not None
+                    and now_monotonic-last_full_analysis<_PRIMARY_FULL_ANALYSIS_INTERVAL_SECONDS
+                )
+                if not full_analysis_throttled:
+                    _last_primary_full_analysis_at[symbol]=now_monotonic
+            if not full_analysis_throttled:
+                full_analysis_started=True
+                decision=unified_decision(symbol)
+                primary=decision["primary_signal"]
+                with _primary_analysis_lock:
+                    _last_primary_full_analysis_at[symbol]=time.monotonic()
 
-        latest=collector.signal_snapshot(symbol)
-        if (
-            latest.get("status") in {"analysis_pending","insufficient_history"}
-            or latest.get("observed_tick_id")!=tick_id
-            or latest.get("observed_epoch")!=signal_data.get("observed_epoch")
-            or not _market_feed_is_fresh(symbol)
-        ):
-            _set_primary_analysis_state(
-                symbol,
-                "STALE_RESULT",
-                last_completed_at=datetime.now(timezone.utc).isoformat(),
-                last_tick_id=tick_id,
-                last_reason="The live tick changed during background qualification; result discarded.",
-            )
-            return False
-
-        with _primary_analysis_lock:
-            last_full_analysis=_last_primary_full_analysis_at.get(symbol)
-            now_monotonic=time.monotonic()
-            if (
-                last_full_analysis is not None
-                and now_monotonic-last_full_analysis<_PRIMARY_FULL_ANALYSIS_INTERVAL_SECONDS
-            ):
-                full_analysis_throttled=True
-            else:
-                _last_primary_full_analysis_at[symbol]=now_monotonic
-                full_analysis_throttled=False
-        if full_analysis_throttled:
-            return _publish_blocked_primary(
-                symbol,
-                signal_data,
-                [data_result,research_result,probability_result],
-                "FULL_ANALYSIS_THROTTLED",
-                worker_status="THROTTLED",
-            )
-
-        full_analysis_started=True
-        decision=unified_decision(symbol)
-        with _primary_analysis_lock:
-            _last_primary_full_analysis_at[symbol]=time.monotonic()
-        primary=decision["primary_signal"]
         current=collector.signal_snapshot(symbol)
         still_current=(
             current.get("status") not in {"analysis_pending","insufficient_history"}
-            and _market_feed_is_fresh(symbol)
+            and not feed_stale
             and primary.get("observed_tick_id")==current.get("observed_tick_id")
             and primary.get("observed_epoch")==current.get("observed_epoch")
         )
-        if not still_current:
+        if feed_stale:
             status="STALE_RESULT"
-            reason="The live tick changed during background qualification; result is not current."
+            reason="The last market tick is stale; agent findings are not a current signal."
+        elif not still_current:
+            status="STALE_RESULT"
+            reason="The live tick changed during agent analysis; result is not current."
         else:
             status="QUALIFIED" if primary["status"]=="QUALIFIED" else "NO_QUALIFIED_SIGNAL"
             reason=_primary_failure_reason(primary)
@@ -396,7 +641,7 @@ def health():
             latest[s]=dict(r) if r else None
     stale={s:not _market_feed_is_fresh(s) for s in settings.symbols}
     pipeline={s:_pipeline_state(s,stored_ticks=counts[s]) for s in settings.symbols}
-    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"pipeline":pipeline,"primary_analysis":_primary_analysis_snapshot(),"recent_errors":collector.errors[-10:]}
+    return {"status":"degraded" if any(stale.values()) else "ok","mode":"paper_only","trading_enabled":False,"symbols":settings.symbols,"tick_counts":counts,"latest":latest,"stale":stale,"pipeline":pipeline,"primary_analysis":_primary_analysis_snapshot(),"agent_activity":_agent_activity_snapshot(),"recent_errors":collector.errors[-10:]}
 
 @app.get("/performance")
 def performance():
@@ -921,7 +1166,13 @@ def unified_decision(symbol: str):
     if not _decision_analysis_lock.acquire(blocking=False):
         raise HTTPException(503,"Decision analysis is already running; retry after it completes.")
     try:
-        return _unified_decision_snapshot(symbol)
+        decision=_unified_decision_snapshot(symbol)
+        _record_agent_activity(
+            symbol,
+            decision,
+            agent_run_persisted=decision.get("agent_run_persisted"),
+        )
+        return decision
     finally:
         _decision_analysis_lock.release()
 
@@ -1049,6 +1300,7 @@ def _unified_decision_snapshot(symbol: str):
         "agents":coordinated["agents"],
         "performance":coordinated["performance"],
         "coordination":coordinated["coordination"],
+        "combined_candidate":coordinated["combined_candidate"],
         "primary_signal":coordinated["primary_signal"],
         "agent_run_persisted":persisted,
     }
@@ -1058,9 +1310,26 @@ def signals(symbol: str):
     """Current candidate forecasts for inspection only; never a trade authorization."""
     if symbol not in settings.symbols: raise HTTPException(404,"Symbol not configured")
     try:
-        return collector.signal_snapshot(symbol)
+        snapshot=collector.signal_snapshot(symbol)
     except KeyError:
         raise HTTPException(404,"Symbol not configured")
+    candidate=build_combined_candidate(
+        snapshot,
+        feed_fresh=_market_feed_is_fresh(symbol),
+        agent_evidence=_agent_evidence_for_tick(symbol,snapshot.get("observed_tick_id")),
+    )
+    latest=collector.signal_snapshot(symbol)
+    if (
+        snapshot.get("observed_tick_id")!=latest.get("observed_tick_id")
+        or snapshot.get("observed_epoch")!=latest.get("observed_epoch")
+    ):
+        candidate=build_combined_candidate(
+            snapshot,
+            feed_fresh=_market_feed_is_fresh(symbol),
+            snapshot_consistent=False,
+            agent_evidence=_agent_evidence_for_tick(symbol,snapshot.get("observed_tick_id")),
+        )
+    return {**snapshot,"combined_candidate":candidate}
 
 @app.get("/signals/primary")
 def primary_signal(symbol: str):
